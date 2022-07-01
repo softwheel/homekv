@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+import "google/protobuf/empty.proto";
+package homekv_service;
+
+message Record {
+    string key = 1;
+    optional bytes value = 2;
+}
+
+message Metrics {
+    uint32 keys_count = 1;
+    uint64 values_size_in_bytes = 2;
+    uint64 cmds_count = 3;
+}
+
+service HomeKvService {
+    rpc Get(GetRequest) returns (GetResponse) {};
+    rpc Set(SetRequest) returns (SetResponse) {};
+    rpc Del(DelRequest) returns (DelResponse) {};
+    rpc Metrics(google.protobuf.Empty) returns (MetricsResponse) {};
+}
+
+// GET Req/Res
+message GetRequest {
+    repeated string keys = 1;
+}
+
+message GetResponse {
+    repeated Record records = 1;
+}
+
+
+// SET Req/Res
+message SetRequest {
+    repeated Record records = 1;
+}
+
+message SetResponse {
+    bool succ = 1;
+}
+
+
+// DEL Req/Res
+message DelRequest {
+    repeated string keys = 1;
+}
+
+message DelResponse {
+    bool succ = 1;
+}
+
+// Metrics Res
+message MetricsResponse {
+    Metrics metrics = 1;
+}
