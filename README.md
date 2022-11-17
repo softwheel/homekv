@@ -1,7 +1,7 @@
 ## HomeKV
 
 ### Basic
-HomeKV is a Rust memory key-value store which support Atomicity.
+HomeKV is a Rust key-value store which support Atomicity.
 Atomicity is implemented by a MVCC storage, which also make Reading
 and Writing don't block each other so that they can run in parallel.
 
@@ -14,6 +14,11 @@ Rust standard lib. The drawback of it is that MVCC needs to clone
 the whole tree to maintain multiple versions. An improvement could
 be change the underlying data structure to B+Tree. But it will be
 more complicated and can not be done in a short time.
+
+### WIP: Making HomeKV a distributed system for large-scale data.
+* Built-in Service Discovery - [Gossip](https://www.cs.cornell.edu/home/rvr/papers/flowgossip.pdf) & [Phi Accrual Failure Detector](https://www.researchgate.net/publication/29682135_The_ph_accrual_failure_detector)
+* Replication Strong Consistence - [Raft](https://raft.github.io/raft.pdf)
+* More Storage Types - [Fragmented LSM](https://www.cs.utexas.edu/~rak/papers/sosp17-pebblesdb.pdf)
 
 ### Server Concurrency Model
 HomeKV uses Rust Tonic as the GRPC package, which handles concurrent requests
