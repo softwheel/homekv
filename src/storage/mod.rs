@@ -1,5 +1,6 @@
 pub mod btree_store;
 pub mod mvcc;
+pub mod flsm;
 
 pub use btree_store::BTreeStore;
 pub use mvcc::Mvcc;
