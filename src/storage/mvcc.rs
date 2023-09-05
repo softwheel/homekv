@@ -47,7 +47,7 @@ pub struct MvccReadTxn<T> {
 impl<T> Clone for MvccReadTxn<T> {
     fn clone(&self) -> Self {
         MvccReadTxn {
-            inner: self.inner.clone()
+            inner: self.inner.clone(),
         }
     }
 }
@@ -66,7 +66,7 @@ where
     pub async fn read(&self) -> MvccReadTxn<T> {
         let rwguard: MutexGuard<Arc<T>> = self.active.lock().await;
         MvccReadTxn {
-            inner: rwguard.clone()
+            inner: rwguard.clone(),
         }
     }
 
@@ -115,7 +115,9 @@ where
             std::mem::swap(&mut data, &mut self.new_data);
             debug_assert!(data.is_none());
         }
-        self.new_data.as_mut().expect("Can not change new_data as a mutable one")
+        self.new_data
+            .as_mut()
+            .expect("Can not change new_data as a mutable one")
     }
 
     pub async fn commit(self) {
@@ -125,7 +127,7 @@ where
 
 impl<'a, T> Deref for MvccWriteTxn<'a, T>
 where
-    T: Clone
+    T: Clone,
 {
     type Target = T;
 
@@ -133,7 +135,7 @@ where
     fn deref(&self) -> &T {
         match &self.new_data {
             Some(nd) => nd,
-            None => &(*self.read)
+            None => &(*self.read),
         }
     }
 }
@@ -180,6 +182,5 @@ mod tests {
         let yet_another_read_txn = mvcc.read().await;
         assert_eq!(*yet_another_read_txn, 1);
         assert_eq!(*read_txn, 0);
-
     }
 }

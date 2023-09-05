@@ -3,9 +3,9 @@ use std::time::Duration;
 #[cfg(not(test))]
 use std::time::Instant;
 
+use super::node::Node;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
-use super::node::Node;
 
 /// A phi accrual failure detector implementation.
 pub struct FailureDetector {
@@ -32,13 +32,16 @@ impl FailureDetector {
     /// Reports node heartbeat.
     pub fn report_heartbeat(&mut self, node: &Node) {
         debug!(node = ?node, "reporting node heartbeat.");
-        let heartbeat_window = self.node_samples.entry(node.clone().into()).or_insert_with(|| {
-            SamplingWindow::new(
-                self.config.sampling_window_size,
-                self.config.max_interval,
-                self.config.initial_interval,
-            )
-        });
+        let heartbeat_window = self
+            .node_samples
+            .entry(node.clone().into())
+            .or_insert_with(|| {
+                SamplingWindow::new(
+                    self.config.sampling_window_size,
+                    self.config.max_interval,
+                    self.config.initial_interval,
+                )
+            });
         heartbeat_window.report_heartbeat();
     }
 
@@ -84,11 +87,11 @@ impl FailureDetector {
     }
 
     fn phi(&mut self, node: &Node) -> Option<f64> {
-        self.node_samples.get(node)
+        self.node_samples
+            .get(node)
             .map(|sampling_window| sampling_window.phi())
     }
 }
-
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct FailureDetectorConfig {
@@ -109,18 +112,17 @@ impl FailureDetectorConfig {
         sampling_window_size: usize,
         max_interval: Duration,
         initial_interval: Duration,
-        dead_node_grace_period: Duration
+        dead_node_grace_period: Duration,
     ) -> Self {
         Self {
             phi_threshold,
             sampling_window_size,
             max_interval,
             initial_interval,
-            dead_node_grace_period
+            dead_node_grace_period,
         }
     }
 }
-
 
 impl Default for FailureDetectorConfig {
     fn default() -> Self {
@@ -230,7 +232,7 @@ impl BoundedArrayStats {
 
     fn len(&self) -> usize {
         if self.is_filled {
-            return self.size
+            return self.size;
         }
         self.index
     }

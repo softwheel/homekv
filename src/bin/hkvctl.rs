@@ -11,10 +11,11 @@ pub mod homekv_service {
 pub struct HomeKvClient {}
 
 impl HomeKvClient {
-
-    pub async fn get(&self, conn: &mut HomeKvServiceClient<Channel>, keys: Vec<String>)
-         -> Result<Vec<Record>, Box<dyn std::error::Error>> {
-
+    pub async fn get(
+        &self,
+        conn: &mut HomeKvServiceClient<Channel>,
+        keys: Vec<String>,
+    ) -> Result<Vec<Record>, Box<dyn std::error::Error>> {
         let request = tonic::Request::new(GetRequest { keys });
 
         println!("Sending request to gRPC Server...");
@@ -23,16 +24,21 @@ impl HomeKvClient {
         Ok(response.into_inner().records)
     }
 
-    pub async fn set(&self, conn: &mut HomeKvServiceClient<Channel>, kvs: Vec<String>)
-         -> Result<bool, Box<dyn std::error::Error>> {
+    pub async fn set(
+        &self,
+        conn: &mut HomeKvServiceClient<Channel>,
+        kvs: Vec<String>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         println!("Setting kvs: {:?}", kvs);
         // FixMe: kvs pattern needs to be verified.
-        let records = kvs.iter().map(
-            |kv| kv.split("=").collect::<Vec<_>>()
-        )
-        .map(
-            |kv_vec| Record {key: kv_vec[0].into(), value: Some(kv_vec[1].into())}
-        ).collect();
+        let records = kvs
+            .iter()
+            .map(|kv| kv.split("=").collect::<Vec<_>>())
+            .map(|kv_vec| Record {
+                key: kv_vec[0].into(),
+                value: Some(kv_vec[1].into()),
+            })
+            .collect();
         let request = tonic::Request::new(SetRequest { records: records });
 
         println!("Sending request to gRPC Server...");
@@ -40,8 +46,11 @@ impl HomeKvClient {
         Ok(response.into_inner().succ)
     }
 
-    pub async fn del(&self, conn: &mut HomeKvServiceClient<Channel>, keys: Vec<String>)
-         -> Result<bool, Box<dyn std::error::Error>> {
+    pub async fn del(
+        &self,
+        conn: &mut HomeKvServiceClient<Channel>,
+        keys: Vec<String>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let request = tonic::Request::new(DelRequest { keys });
 
         println!("Sending request to gRPC Server...");
@@ -49,8 +58,10 @@ impl HomeKvClient {
         Ok(response.into_inner().succ)
     }
 
-    pub async fn metrics(&self, conn: &mut HomeKvServiceClient<Channel>)
-           -> Result<Metrics, Box<dyn std::error::Error>> {
+    pub async fn metrics(
+        &self,
+        conn: &mut HomeKvServiceClient<Channel>,
+    ) -> Result<Metrics, Box<dyn std::error::Error>> {
         let request = tonic::Request::new(());
 
         println!("Sending request to gRPC Server...");
@@ -68,7 +79,7 @@ enum CMD {
 }
 
 #[derive(Parser, Debug)]
-#[clap(author="Haili Zhang", version="0.1.0", about="A Mem KV Store")]
+#[clap(author = "Haili Zhang", version = "0.1.0", about = "A Mem KV Store")]
 struct Args {
     /// Server Host
     #[clap(short, long, default_value_t= String::from("127.0.0.1"))]
@@ -96,9 +107,8 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let mut conn = HomeKvServiceClient::connect(
-        format!("http://{}:{}", args.host, args.port)
-    ).await?;
+    let mut conn =
+        HomeKvServiceClient::connect(format!("http://{}:{}", args.host, args.port)).await?;
 
     let home_kv_client = HomeKvClient {};
 
@@ -125,10 +135,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         println!()
                     }
-                },
-                Err(e) => println!("Get runs in error: {:?}", e)
+                }
+                Err(e) => println!("Get runs in error: {:?}", e),
             }
-        },
+        }
         CMD::SET => {
             println!("cmd: {:?}", args.cmd);
 
@@ -137,9 +147,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match home_kv_client.set(&mut conn, kvs).await {
                 Ok(succ) => println!("Set SUCCESS? {}", succ),
-                Err(e) => println!("Set runs in error: {:?}", e)
+                Err(e) => println!("Set runs in error: {:?}", e),
             }
-        },
+        }
         CMD::DEL => {
             println!("cmd: {:?}", args.cmd);
 
@@ -148,14 +158,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match home_kv_client.del(&mut conn, keys).await {
                 Ok(succ) => println!("Del SUCCESS? {}", succ),
-                Err(e) => println!("Del runs in error: {:?}", e)
+                Err(e) => println!("Del runs in error: {:?}", e),
             }
         }
         CMD::METRICS => {
             println!("cmd: {:?}", args.cmd);
             match home_kv_client.metrics(&mut conn).await {
                 Ok(metrics) => println!("Metrics: {:?}", metrics),
-                Err(e) => println!("Metrics runs in error: {:?}", e)
+                Err(e) => println!("Metrics runs in error: {:?}", e),
             }
         }
     }

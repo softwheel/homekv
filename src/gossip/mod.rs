@@ -1,36 +1,36 @@
 #![allow(clippy::type_complexity)]
 #![allow(clippy::derive_partial_eq_without_eq)]
 
-pub mod message;
-pub mod node;
-pub mod state;
+pub mod configuration;
 pub mod delta;
 pub mod digest;
-pub mod serialize;
 pub mod failure_detector;
-pub mod configuration;
-pub mod transport;
+pub mod message;
+pub mod node;
+pub mod serialize;
 pub mod server;
+pub mod state;
+pub mod transport;
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::iter::Iterator;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{watch, Mutex};
-use tokio_stream::wrappers::WatchStream;
-use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver};
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::WatchStream;
 use tracing::{error, warn};
 
-pub use node::Node;
-pub use state::{ClusterStateSnapshot, NodeState};
-use state::ClusterState;
+pub use configuration::GossipConfig;
 pub use delta::Delta;
 pub use digest::Digest;
-pub use configuration::GossipConfig;
 pub use failure_detector::FailureDetector;
-use message::{GossipMessage, syn_ack_serialized_len};
+use message::{syn_ack_serialized_len, GossipMessage};
+pub use node::Node;
+use state::ClusterState;
+pub use state::{ClusterStateSnapshot, NodeState};
 
 /// Map key for the heartbeat node value.
 pub(crate) const HEARTBEAT_KEY: &str = "heartbeat";
@@ -69,10 +69,8 @@ impl Gossiper {
         seed_addrs: watch::Receiver<HashSet<SocketAddr>>,
         initial_key_values: Vec<(String, String)>,
     ) -> Self {
-        let (ready_nodes_watcher_tx, ready_nodes_watcher_rx) =
-            watch::channel(HashSet::new());
-        let failure_detector =
-            FailureDetector::new(config.failure_detector_config.clone());
+        let (ready_nodes_watcher_tx, ready_nodes_watcher_rx) = watch::channel(HashSet::new());
+        let failure_detector = FailureDetector::new(config.failure_detector_config.clone());
         let mut gossiper = Gossiper {
             config,
             cluster_state: ClusterState::with_seed_addrs(seed_addrs),
@@ -128,15 +126,22 @@ impl Gossiper {
                 let dead_nodes = self.dead_nodes().collect::<HashSet<_>>();
                 let empty_delta = Delta::default();
                 let delta_mtu = MTU - syn_ack_serialized_len(&self_digest, &empty_delta);
-                let delta = self.cluster_state.compute_delta(&digest, delta_mtu, dead_nodes);
+                let delta = self
+                    .cluster_state
+                    .compute_delta(&digest, delta_mtu, dead_nodes);
                 self.report_to_failure_detector(&delta);
-                Some(GossipMessage::SynAck { digest: self_digest, delta })
+                Some(GossipMessage::SynAck {
+                    digest: self_digest,
+                    delta,
+                })
             }
             GossipMessage::SynAck { digest, delta } => {
                 self.report_to_failure_detector(&delta);
                 self.cluster_state.apply_delta(delta);
                 let dead_nodes = self.dead_nodes().collect::<HashSet<_>>();
-                let delta = self.cluster_state.compute_delta(&digest, MTU -1, dead_nodes);
+                let delta = self
+                    .cluster_state
+                    .compute_delta(&digest, MTU - 1, dead_nodes);
                 Some(GossipMessage::Ack { delta })
             }
             GossipMessage::Ack { delta } => {
@@ -153,7 +158,9 @@ impl Gossiper {
 
     fn report_to_failure_detector(&mut self, delta: &Delta) {
         for (node, node_delta) in &delta.node_deltas {
-            let local_max_version = self.cluster_state.node_states
+            let local_max_version = self
+                .cluster_state
+                .node_states
                 .get(node)
                 .map(|node_state| node_state.max_version)
                 .unwrap_or(0);
@@ -166,7 +173,9 @@ impl Gossiper {
 
     /// Checks and marks nodes as dead / live / ready.
     pub fn update_nodes_liveness(&mut self) {
-        let cluster_nodes = self.cluster_state.nodes()
+        let cluster_nodes = self
+            .cluster_state
+            .nodes()
             .filter(|&node| node != self.self_node())
             .collect::<Vec<_>>();
         for &node in &cluster_nodes {
@@ -210,13 +219,12 @@ impl Gossiper {
 
     fn ready_nodes(&self) -> impl Iterator<Item = &Node> {
         self.live_nodes().filter(|node| {
-            let is_ready_pred =
-                if let Some(pred) = self.config.is_ready_predicate.as_ref() {
-                    pred
-                } else {
-                    // No predicate means that we consider all nodes as ready.
-                    return true;
-                };
+            let is_ready_pred = if let Some(pred) = self.config.is_ready_predicate.as_ref() {
+                pred
+            } else {
+                // No predicate means that we consider all nodes as ready.
+                return true;
+            };
             self.node_state(node).map(is_ready_pred).unwrap_or(false)
         })
     }
@@ -279,7 +287,9 @@ impl GossipHandle {
     }
 
     pub async fn with_gossiper<F, T>(&self, mut fun: F) -> T
-        where F: FnMut(&mut Gossiper) -> T {
+    where
+        F: FnMut(&mut Gossiper) -> T,
+    {
         let mut gossiper = self.gossiper.lock().await;
         fun(&mut gossiper)
     }

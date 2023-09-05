@@ -1,15 +1,15 @@
-use std::collections::{BinaryHeap, BTreeMap, HashSet};
-use std::collections::hash_map::Entry;
-use std::net::SocketAddr;
 use log::Level::Debug;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::net::SocketAddr;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use super::{VersionedValue, Version};
-use super::node::Node;
-use super::digest::Digest;
 use super::delta::{Delta, DeltaWriter};
+use super::digest::Digest;
+use super::node::Node;
+use super::{Version, VersionedValue};
 
 /// Maximum value size (in bytes) for a key-value item.
 const MAX_KV_SIZE: usize = 500;
@@ -18,7 +18,7 @@ const MAX_KV_SIZE: usize = 500;
 pub struct NodeState {
     pub(crate) key_values: BTreeMap<String, VersionedValue>,
     #[serde(skip)]
-    #[serde(default="Instant::now")]
+    #[serde(default = "Instant::now")]
     last_heartbeat: Instant,
     pub(crate) max_version: u64,
 }
@@ -35,10 +35,13 @@ impl Default for NodeState {
 
 impl NodeState {
     /// Return an iterator over the version values that are older than `floor_version`.
-    fn iter_stale_key_values(&self, floor_version: Version)
-        -> impl Iterator<Item = (&str, &VersionedValue)> {
+    fn iter_stale_key_values(
+        &self,
+        floor_version: Version,
+    ) -> impl Iterator<Item = (&str, &VersionedValue)> {
         // TODO optimize by checking the max version.
-        self.key_values.iter()
+        self.key_values
+            .iter()
             .filter(move |&(_key, versioned_value)| versioned_value.version > floor_version)
             .map(|(key, record)| (key.as_str(), record))
     }
@@ -67,10 +70,13 @@ impl NodeState {
         assert!(
             value_size <= MAX_KV_SIZE,
             "Value for key `{}` is too larget (actual: {}, maximum: {})",
-            key, value_size, MAX_KV_SIZE
+            key,
+            value_size,
+            MAX_KV_SIZE
         );
         self.max_version = version;
-        self.key_values.insert(key, VersionedValue { version, value });
+        self.key_values
+            .insert(key, VersionedValue { version, value });
     }
 }
 
@@ -120,8 +126,10 @@ impl ClusterState {
 
     pub(crate) fn apply_delta(&mut self, delta: Delta) {
         for (node, node_delta) in delta.node_deltas {
-            let mut node_state_map = self.node_states
-                .entry(node).or_insert_with(NodeState::default);
+            let mut node_state_map = self
+                .node_states
+                .entry(node)
+                .or_insert_with(NodeState::default);
 
             for (key, versioned_value) in node_delta.key_values {
                 node_state_map.max_version =
@@ -147,7 +155,9 @@ impl ClusterState {
 
     pub fn compute_digest(&self, dead_nodes: HashSet<&Node>) -> Digest {
         Digest {
-            node_max_version: self.node_states.iter()
+            node_max_version: self
+                .node_states
+                .iter()
                 .filter(|(node, _)| !dead_nodes.contains(node))
                 .map(|(node, node_state)| (node.clone(), node_state.max_version))
                 .collect(),
@@ -183,7 +193,7 @@ impl ClusterState {
             stale_kvs.sort_unstable_by_key(|(_, record)| record.version);
             for (key, versioned_value) in stale_kvs {
                 if !delta_writer.add_kv(key, versioned_value.clone()) {
-                    return delta_writer.into()
+                    return delta_writer.into();
                 }
             }
         }
@@ -223,7 +233,6 @@ fn random_generator() -> impl Rng {
     rand::thread_rng()
 }
 
-
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ClusterStateSnapshot {
     pub seed_addrs: HashSet<SocketAddr>,
@@ -234,9 +243,11 @@ impl<'a> From<&'a ClusterState> for ClusterStateSnapshot {
     fn from(state: &'a ClusterState) -> Self {
         ClusterStateSnapshot {
             seed_addrs: state.seed_addrs(),
-            node_states: state.node_states.iter()
+            node_states: state
+                .node_states
+                .iter()
                 .map(|(node, node_state)| (node.id.clone(), node_state.clone()))
-                .collect()
+                .collect(),
         }
     }
 }

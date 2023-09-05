@@ -1,4 +1,6 @@
-/// [`Node`] represents a HomeTalk Node
+use super::serialize::Serializable;
+use serde::Serialize;
+/// [`Node`] represents a Gossiper Node
 ///
 /// For the lifetime of a cluster, nodes can go down and back up,
 /// they may permanently die. These are couple of issues we want
@@ -37,8 +39,6 @@
 /// in the past. We believe this very rare and things should just work
 /// fine.
 use std::net::SocketAddr;
-use serde::Serialize;
-use super::serialize::Serializable;
 
 pub struct Node {
     // The unique id of this node in the cluster.
@@ -49,16 +49,13 @@ pub struct Node {
 
 impl Node {
     pub fn new(id: String, gossip_address: SocketAddr) -> Self {
-        Self {
-            id,
-            gossip_address
-        }
+        Self { id, gossip_address }
     }
 
     pub fn with_localhost_port(port: u16) -> Self {
         Node::new(
             format!("node-{port}"),
-            ([127u8, 0u8, 0u8, 1u8], port).into()
+            ([127u8, 0u8, 0u8, 1u8], port).into(),
         )
     }
 

@@ -1,5 +1,5 @@
-use std::io::BufRead;
 use serde::Serialize;
+use std::io::BufRead;
 
 use super::delta::Delta;
 use super::digest::Digest;
@@ -76,7 +76,9 @@ impl Serializable for GossipMessage {
     }
 
     fn deserialize(buf: &mut &[u8]) -> anyhow::Result<Self> {
-        let code = buf.first().cloned()
+        let code = buf
+            .first()
+            .cloned()
             .and_then(MessageType::from_code)
             .context("Invalid message type")?;
         buf.consume(1);
@@ -104,12 +106,8 @@ impl Serializable for GossipMessage {
             GossipMessage::Syn { cluster_id, digest } => {
                 1 + cluster_id.serialized_len() + digest.serialized_len()
             }
-            GossipMessage::SynAck { digest, delta } => {
-                syn_ack_serialized_len(digest, delta)
-            }
-            GossipMessage::Ack { delta } => {
-                1 + delta.serialized_len()
-            }
+            GossipMessage::SynAck { digest, delta } => syn_ack_serialized_len(digest, delta),
+            GossipMessage::Ack { delta } => 1 + delta.serialized_len(),
             GossipMessage::BadCluster => 1,
         }
     }
