@@ -1,12 +1,11 @@
+use serde::Serialize;
 use std::io::BufRead;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use serde::Serialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 use anyhow::{bail, Context};
 
 use super::node::Node;
-
 
 /// Trait for serializing messages.
 ///
@@ -89,7 +88,9 @@ impl Serializable for IpAddr {
     }
 
     fn deserialize(buf: &mut &[u8]) -> anyhow::Result<Self> {
-        let ip_version_byte = buf.first().cloned()
+        let ip_version_byte = buf
+            .first()
+            .cloned()
             .context("Failed to deserialize IpAddr: empty buffer.")?;
         let ip_version = IpVersion::try_from(ip_version_byte)?;
         buf.consume(1);

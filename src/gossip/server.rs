@@ -1,21 +1,18 @@
 use std::collections::HashSet;
-use std::hash::Hash;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::lookup_host;
 
 use rand::prelude::*;
-use tokio::time;
-use tokio::task::JoinHandle;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{mpsc, watch, Mutex};
-use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver};
+use tokio::time;
 use tracing::{debug, error, info, warn};
 
-use super::{Gossiper, GossipConfig, GossipHandle, Command};
 use super::message::GossipMessage;
-use super::node::Node;
-use super::transport::{Transport, Socket};
+use super::transport::{Socket, Transport};
+use super::{Command, GossipConfig, GossipHandle, Gossiper};
 
 /// Number of nodes picked for random gossip.
 const GOSSIP_COUNT: usize = 3;
@@ -86,13 +83,11 @@ async fn spawn_dns_refresh_loop(seeds: &[String]) -> watch::Receiver<HashSet<Soc
 
     let (seed_addrs_tx, seed_addrs_rx) = watch::channel(initial_seed_addrs);
     if !seed_requiring_dns.is_empty() {
-        tokio::task::spawn(
-            dns_refresh_loop(
-                seed_requiring_dns,
-                seed_addrs_not_requiring_resolution,
-                seed_addrs_tx,
-            )
-        );
+        tokio::task::spawn(dns_refresh_loop(
+            seed_requiring_dns,
+            seed_addrs_not_requiring_resolution,
+            seed_addrs_tx,
+        ));
     }
     seed_addrs_rx
 }
@@ -100,7 +95,7 @@ async fn spawn_dns_refresh_loop(seeds: &[String]) -> watch::Receiver<HashSet<Soc
 pub async fn spawn_gossip(
     config: GossipConfig,
     initial_key_values: Vec<(String, String)>,
-    transport: &dyn Transport
+    transport: &dyn Transport,
 ) -> anyhow::Result<GossipHandle> {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let seed_addrs: watch::Receiver<HashSet<SocketAddr>> =
@@ -143,7 +138,7 @@ impl Server {
             gossiper,
             command_rx,
             transport,
-            rng
+            rng,
         }
     }
 
@@ -173,8 +168,11 @@ impl Server {
     }
 
     /// Process a single UDP packet.
-    async fn handle_message(&mut self, from_addr: SocketAddr, message: GossipMessage)
-        -> anyhow::Result<()> {
+    async fn handle_message(
+        &mut self,
+        from_addr: SocketAddr,
+        message: GossipMessage,
+    ) -> anyhow::Result<()> {
         let response = self.gossiper.lock().await.process_message(message);
         if let Some(message) = response {
             self.transport.send(from_addr, message).await?;
@@ -187,26 +185,26 @@ impl Server {
         let mut gossiper_guard = self.gossiper.lock().await;
         let cluster_state = gossiper_guard.cluster_state();
 
-        let peer_nodes = cluster_state.nodes()
+        let peer_nodes = cluster_state
+            .nodes()
             .filter(|node| *node != gossiper_guard.self_node())
             .map(|node| node.gossip_address)
             .collect::<HashSet<_>>();
-        let live_nodes = gossiper_guard.live_nodes()
+        let live_nodes = gossiper_guard
+            .live_nodes()
             .map(|node| node.gossip_address)
             .collect::<HashSet<_>>();
-        let dead_nodes = gossiper_guard.dead_nodes()
+        let dead_nodes = gossiper_guard
+            .dead_nodes()
             .map(|node| node.gossip_address)
             .collect::<HashSet<_>>();
         let seed_nodes: HashSet<SocketAddr> = gossiper_guard.seed_addrs();
-        let (
-            selected_nodes,
-            random_dead_node_opt,
-            random_seed_node_opt) = select_nodes_for_gossip(
+        let (selected_nodes, random_dead_node_opt, random_seed_node_opt) = select_nodes_for_gossip(
             &mut self.rng,
             peer_nodes,
             live_nodes,
             dead_nodes,
-            seed_nodes
+            seed_nodes,
         );
 
         gossiper_guard.update_heartbeat();
@@ -229,7 +227,7 @@ impl Server {
         }
 
         if let Some(random_seed_node) = random_seed_node_opt {
-            if result = self.gossip(random_seed_node).await;
+            result = self.gossip(random_seed_node).await;
             if result.is_err() {
                 error!(node = ?random_seed_node, "Gossip error with a seed node.")
             }
@@ -246,70 +244,3 @@ impl Server {
         Ok(())
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

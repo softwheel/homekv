@@ -1,7 +1,7 @@
 #![allow(clippy::derive_partial_eq_without_eq)]
 
-use std::time::Duration;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use super::failure_detector::FailureDetectorConfig;
 use super::node::Node;

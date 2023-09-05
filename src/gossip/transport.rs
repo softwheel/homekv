@@ -1,8 +1,8 @@
-use std::net::SocketAddr;
+use crate::gossip::serialize::Serializable;
 use anyhow::Context;
 use async_trait::async_trait;
+use std::net::SocketAddr;
 use tracing::warn;
-use crate::gossip::serialize::Serializable;
 
 use super::message::GossipMessage;
 use super::MTU;
@@ -59,8 +59,11 @@ impl Socket for UdpSocket {
 
 impl UdpSocket {
     async fn receive_one(&mut self) -> anyhow::Result<Option<(SocketAddr, GossipMessage)>> {
-        let (len, from_addr) = self.socket.recv_from(&mut self.buf_recv[..])
-            .await.context("Error while receiving UDP message")?;
+        let (len, from_addr) = self
+            .socket
+            .recv_from(&mut self.buf_recv[..])
+            .await
+            .context("Error while receiving UDP message")?;
         let mut buf = &self.buf_recv[..len];
         match GossipMessage::deserialize(&mut buf) {
             Ok(msg) => Ok(Some((from_addr, msg))),
@@ -71,8 +74,13 @@ impl UdpSocket {
         }
     }
 
-    pub(crate) async fn send_bytes(&self, to_addr: SocketAddr, payload: &[u8]) -> anyhow::Result<()> {
-        self.socket.send_to(payload, to_addr)
+    pub(crate) async fn send_bytes(
+        &self,
+        to_addr: SocketAddr,
+        payload: &[u8],
+    ) -> anyhow::Result<()> {
+        self.socket
+            .send_to(payload, to_addr)
             .await
             .context("Failed to send gossip message to target")?;
         Ok(())

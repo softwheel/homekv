@@ -49,7 +49,8 @@ pub(crate) struct NodeDelta {
 
 impl NodeDelta {
     pub fn max_version(&self) -> Version {
-        self.key_values.values()
+        self.key_values
+            .values()
             .map(|value| value.version)
             .max()
             .unwrap_or(0)
@@ -65,7 +66,6 @@ pub struct DeltaWriter {
     reached_capacity: bool,
 }
 
-
 impl DeltaWriter {
     pub fn with_mtu(mtu: usize) -> Self {
         DeltaWriter {
@@ -74,7 +74,7 @@ impl DeltaWriter {
             num_bytes: 2,
             current_node: None,
             current_node_delta: NodeDelta::default(),
-            reached_capacity: false
+            reached_capacity: false,
         }
     }
 
@@ -90,9 +90,7 @@ impl DeltaWriter {
         assert!(Some(&node) != self.current_node.as_ref());
         assert!(!self.delta.node_deltas.contains_key(&node));
         self.flush();
-        if !self.attempt_add_bytes(
-            2 + node.id.len() + node.gossip_address.serialized_len() + 2
-        ) {
+        if !self.attempt_add_bytes(2 + node.id.len() + node.gossip_address.serialized_len() + 2) {
             return false;
         }
         self.current_node = Some(node);
@@ -115,7 +113,9 @@ impl DeltaWriter {
         if !self.attempt_add_bytes(2 + key.len() + 2 + versioned_value.value.len() + 8) {
             return false;
         }
-        self.current_node_delta.key_values.insert(key.to_string(), versioned_value);
+        self.current_node_delta
+            .key_values
+            .insert(key.to_string(), versioned_value);
         true
     }
 }
@@ -165,98 +165,3 @@ impl Serializable for NodeDelta {
         len
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

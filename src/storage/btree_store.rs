@@ -3,7 +3,6 @@ use crate::common::error::Result;
 
 use std::collections::BTreeMap;
 
-
 /// In-memory key-value store using the Rust standard library B-tree implementation.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BTreeStore {
@@ -13,7 +12,9 @@ pub struct BTreeStore {
 impl BTreeStore {
     /// Creates a new Memory key-value storage engine.
     pub fn new() -> Self {
-        Self { data: BTreeMap::new() }
+        Self {
+            data: BTreeMap::new(),
+        }
     }
 }
 

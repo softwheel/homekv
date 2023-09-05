@@ -1,11 +1,19 @@
-use homekv::storage::{Mvcc, BTreeStore};
-use homekv::storage::Store;
-use std::sync::Arc;
-use atomic_counter::{AtomicCounter, RelaxedCounter};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tonic::transport::Server;
-use tonic::{Request, Response, Status, Code};
+use std::sync::Arc;
+use std::time::Duration;
+
+use atomic_counter::{AtomicCounter, RelaxedCounter};
 use clap::Parser;
+use tokio::sync::Mutex;
+use tonic::transport::Server;
+use tonic::{Code, Request, Response, Status};
+
+use homekv::gossip::failure_detector::FailureDetectorConfig;
+use homekv::gossip::server::spawn_gossip;
+use homekv::gossip::transport::UdpTransport;
+use homekv::gossip::{GossipConfig, Gossiper, Node};
+use homekv::storage::Store;
+use homekv::storage::{BTreeStore, Mvcc};
 
 // GRPC Service
 use homekv_service::home_kv_service_server::{HomeKvService, HomeKvServiceServer};
@@ -28,7 +36,7 @@ impl StoreStatus {
         StoreStatus {
             keys_count: Arc::new(RelaxedCounter::new(0)),
             values_size_in_bytes: Arc::new(AtomicUsize::new(0)),
-            cmds_count: Arc::new(RelaxedCounter::new(0))
+            cmds_count: Arc::new(RelaxedCounter::new(0)),
         }
     }
 }
@@ -37,22 +45,25 @@ impl StoreStatus {
 pub struct HomeKvServer {
     store: Mvcc<BTreeStore>,
     status: StoreStatus,
+    gossiper: Arc<Mutex<Gossiper>>,
 }
 
 impl HomeKvServer {
-    pub fn new() -> Self {
+    pub fn with_gossiper(gossiper: Arc<Mutex<Gossiper>>) -> Self {
         HomeKvServer {
             store: Mvcc::new(BTreeStore::new()),
             status: StoreStatus::new(),
+            gossiper,
         }
     }
 }
 
 #[tonic::async_trait]
 impl HomeKvService for HomeKvServer {
-    async fn get(&self, request: Request<GetRequest>)
-        -> std::result::Result<Response<GetResponse>, Status> {
-
+    async fn get(
+        &self,
+        request: Request<GetRequest>,
+    ) -> std::result::Result<Response<GetResponse>, Status> {
         // Increase Command Calling Count Status
         self.status.cmds_count.inc();
 
@@ -65,18 +76,19 @@ impl HomeKvService for HomeKvServer {
         let read_txn = self.store.read().await;
         for key in keys {
             if let Ok(value) = read_txn.get(key.as_bytes()) {
-                records.push(Record {key, value});
+                records.push(Record { key, value });
             } else {
                 return Err(Status::new(Code::Internal, "Internal Storage Error"));
             }
         }
 
-        Ok(Response::new(GetResponse {records}))
+        Ok(Response::new(GetResponse { records }))
     }
 
-    async fn set(&self, request: Request<SetRequest>)
-        -> std::result::Result<Response<SetResponse>, Status> {
-
+    async fn set(
+        &self,
+        request: Request<SetRequest>,
+    ) -> std::result::Result<Response<SetResponse>, Status> {
         // Increase Command Calling Count Status
         self.status.cmds_count.inc();
 
@@ -99,27 +111,26 @@ impl HomeKvService for HomeKvServer {
                 match mut_store.get(record_key) {
                     Ok(Some(old_value)) => {
                         values_size -= old_value.len() as i32;
-                        println!("Dealing with an existing key: {:?}, old_value_size: {}", record.key, old_value.len());
+                        println!(
+                            "Dealing with an existing key: {:?}, old_value_size: {}",
+                            record.key,
+                            old_value.len()
+                        );
                     }
                     Ok(None) => {
                         println!("Dealing with a non-existing key: {:?}", record.key);
                         keys_count += 1;
                         values_size += value.len() as i32;
                     }
-                    Err(_) => {
-                        return Err(Status::new(Code::Internal, "Internal Storage Error"))
-                    }
+                    Err(_) => return Err(Status::new(Code::Internal, "Internal Storage Error")),
                 }
 
                 // Upsert
                 match mut_store.set(record_key, value) {
-                    Err(_) => {
-                        return Err(Status::new(Code::Internal, "Internal Storage Error"))
-                    },
-                    Ok(()) => ()
+                    Err(_) => return Err(Status::new(Code::Internal, "Internal Storage Error")),
+                    Ok(()) => (),
                 }
             } else {
-
                 // Decrease keys_count and values_size for removing existing key
                 match mut_store.get(record_key) {
                     Ok(Some(old_value)) => {
@@ -127,17 +138,13 @@ impl HomeKvService for HomeKvServer {
                         values_size -= old_value.len() as i32;
                     }
                     Ok(None) => (),
-                    Err(_) => {
-                        return Err(Status::new(Code::Internal, "Internal Storage Error"))
-                    }
+                    Err(_) => return Err(Status::new(Code::Internal, "Internal Storage Error")),
                 }
 
                 // Delete
                 match mut_store.delete(record_key) {
-                    Err(_) => {
-                        return Err(Status::new(Code::Internal, "Internal Storage Error"))
-                    },
-                    Ok(()) => ()
+                    Err(_) => return Err(Status::new(Code::Internal, "Internal Storage Error")),
+                    Ok(()) => (),
                 }
             }
         }
@@ -149,18 +156,22 @@ impl HomeKvService for HomeKvServer {
         self.status.keys_count.add(keys_count);
         // Update Value Size Status
         if values_size < 0 {
-            self.status.values_size_in_bytes.fetch_sub(values_size.abs() as usize, Ordering::Relaxed);
-        }
-        else {
-            self.status.values_size_in_bytes.fetch_add(values_size as usize, Ordering::Relaxed);
+            self.status
+                .values_size_in_bytes
+                .fetch_sub(values_size.abs() as usize, Ordering::Relaxed);
+        } else {
+            self.status
+                .values_size_in_bytes
+                .fetch_add(values_size as usize, Ordering::Relaxed);
         }
 
-        Ok(Response::new(SetResponse {succ: true}))
+        Ok(Response::new(SetResponse { succ: true }))
     }
 
-    async fn del(&self, request: Request<DelRequest>)
-        -> std::result::Result<Response<DelResponse>, Status> {
-
+    async fn del(
+        &self,
+        request: Request<DelRequest>,
+    ) -> std::result::Result<Response<DelResponse>, Status> {
         // Increase Command Calling Count Status
         self.status.cmds_count.inc();
 
@@ -182,16 +193,12 @@ impl HomeKvService for HomeKvServer {
                     values_size -= old_value.len() as i32;
                 }
                 Ok(None) => (),
-                Err(_) => {
-                    return Err(Status::new(Code::Internal, "Internal Storage Error"))
-                }
+                Err(_) => return Err(Status::new(Code::Internal, "Internal Storage Error")),
             }
 
             match mut_store.delete(record_key) {
                 Ok(()) => (),
-                Err(_) => {
-                    return Err(Status::new(Code::Internal, "Internal Storage Error"))
-                }
+                Err(_) => return Err(Status::new(Code::Internal, "Internal Storage Error")),
             }
         }
 
@@ -199,27 +206,32 @@ impl HomeKvService for HomeKvServer {
 
         // Commit Success
         self.status.keys_count.add(keys_count as usize);
-        self.status.values_size_in_bytes.fetch_add(values_size as usize, Ordering::Relaxed);
+        self.status
+            .values_size_in_bytes
+            .fetch_add(values_size as usize, Ordering::Relaxed);
 
-        Ok(Response::new(DelResponse {succ: true}))
+        Ok(Response::new(DelResponse { succ: true }))
     }
 
     #[allow(unused_variables)]
-    async fn metrics(&self, request: Request<()>) -> std::result::Result<Response<MetricsResponse>, Status> {
+    async fn metrics(
+        &self,
+        request: Request<()>,
+    ) -> std::result::Result<Response<MetricsResponse>, Status> {
         println!("Got a metrics request");
         Ok(Response::new(MetricsResponse {
             metrics: Some(Metrics {
                 keys_count: self.status.keys_count.get() as u32,
-                values_size_in_bytes: self.status.values_size_in_bytes.load(Ordering::Relaxed) as u64,
+                values_size_in_bytes: self.status.values_size_in_bytes.load(Ordering::Relaxed)
+                    as u64,
                 cmds_count: self.status.cmds_count.get() as u64,
-            })
+            }),
         }))
     }
 }
 
-
 #[derive(Parser, Debug)]
-#[clap(author="Haili Zhang", version="0.1.0", about="A Mem KV Store")]
+#[clap(author = "Haili Zhang", version = "0.1.0", about = "A Mem KV Store")]
 struct Args {
     /// Server Host
     #[clap(short, long, default_value_t = String::from("127.0.0.1"))]
@@ -235,7 +247,19 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let addr = format!("{}:{}", args.host, args.port).parse()?;
-    let homekv = HomeKvServer::new();
+    let node = Node::new("default-node-1".to_string(), "127.0.0.1:8888");
+    let config = GossipConfig {
+        node,
+        cluster_id: "testing".to_string(),
+        gossip_interval: Duration::from_millis(opt.interval),
+        listen_addr: opt.listen_addr,
+        seed_nodes: opt.seeds.clone(),
+        failure_detector_config: FailureDetectorConfig::default(),
+        is_ready_predicate: None,
+    };
+    let gossip_handler = spawn_gossip(config, Vec::new(), &UdpTransport).await?;
+    let gossiper = gossip_handler.gossiper();
+    let homekv = HomeKvServer::with_gossiper(gossiper);
 
     Server::builder()
         .add_service(HomeKvServiceServer::new(homekv))

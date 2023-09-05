@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
-use super::Version;
 use super::node::Node;
 use super::serialize::*;
+use super::Version;
 
 /// A digest is a piece of information summarizing
 /// the staleness of one peer's data.
