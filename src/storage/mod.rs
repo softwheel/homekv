@@ -1,4 +1,5 @@
 pub mod btree_store;
+pub mod lsm;
 pub mod mvcc;
 
 pub use btree_store::BTreeStore;

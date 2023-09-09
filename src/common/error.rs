@@ -11,6 +11,7 @@ pub enum Error {
     Internal(String),
     Parse(String),
     ReadOnly,
+    NotFound,
     Serialization,
     Value(String),
 }
@@ -26,6 +27,7 @@ impl Display for Error {
             Error::Abort => write!(f, "Operation aborted"),
             Error::Serialization => write!(f, "Serialization failure, retry transaction"),
             Error::ReadOnly => write!(f, "Read-only transaction"),
+            Error::NotFound => write!(f, "Key NotFound"),
         }
     }
 }
