@@ -1,10 +1,12 @@
+use crate::consistent_hash::ConsistentHashNode;
+
 use super::serialize::Serializable;
 use serde::Serialize;
-/// [`Node`] represents a Gossiper Node
+/// [`HoneyBee`] represents a node of a HoneyBees gossip cluster.
 ///
 /// For the lifetime of a cluster, nodes can go down and back up,
 /// they may permanently die. These are couple of issues we want
-/// to solve with [`Node`] struct:
+/// to solve with [`HoneyBee`] struct:
 /// - We want a fresh local HomeTalk state for every run of a node.
 /// - We don't want other nodes to override a newly started node state
 ///   with an obsolete state.
@@ -40,20 +42,26 @@ use serde::Serialize;
 /// fine.
 use std::net::SocketAddr;
 
-pub struct Node {
+pub struct HoneyBee {
     // The unique id of this node in the cluster.
     pub id: String,
     // The SocketAddr other peers should use to communicate.
     pub gossip_address: SocketAddr,
+    // liveness state
+    pub is_alive: u16,
 }
 
-impl Node {
+impl HoneyBee {
     pub fn new(id: String, gossip_address: SocketAddr) -> Self {
-        Self { id, gossip_address }
+        Self {
+            id,
+            gossip_address,
+            is_alive: 1,
+        }
     }
 
     pub fn with_localhost_port(port: u16) -> Self {
-        Node::new(
+        HoneyBee::new(
             format!("node-{port}"),
             ([127u8, 0u8, 0u8, 1u8], port).into(),
         )
@@ -65,7 +73,7 @@ impl Node {
     }
 }
 
-impl Serializable for Node {
+impl Serializable for HoneyBee {
     fn serialize(&self, buf: &mut Vec<u8>) {
         self.id.serialize(buf);
         self.gossip_address.serialize(buf);
@@ -74,10 +82,25 @@ impl Serializable for Node {
     fn deserialize(buf: &mut &[u8]) -> anyhow::Result<Self> {
         let id = String::deserialize(buf)?;
         let gossip_address = SocketAddr::deserialize(buf)?;
-        Ok(Node { id, gossip_address })
+        let is_alive = u16::deserialize(buf)?;
+        Ok(HoneyBee {
+            id,
+            gossip_address,
+            is_alive,
+        })
     }
 
     fn serialized_len(&self) -> usize {
         self.id.serialized_len() + self.gossip_address.serialized_len()
+    }
+}
+
+impl ConsistentHashNode for HoneyBee {
+    fn name(&self) -> &str {
+        &self.id
+    }
+
+    fn is_valid(&self) -> bool {
+        self.is_alive == 1
     }
 }

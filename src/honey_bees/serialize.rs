@@ -5,7 +5,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 use anyhow::{bail, Context};
 
-use super::node::Node;
+use super::node::HoneyBee;
 
 /// Trait for serializing messages.
 ///

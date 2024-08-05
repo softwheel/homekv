@@ -3,13 +3,13 @@ use std::mem;
 
 use anyhow;
 
-use super::node::Node;
+use super::node::HoneyBee;
 use super::serialize::*;
 use super::{Version, VersionedValue};
 
 #[derive(Default, Eq, PartialEq, Debug)]
 pub struct Delta {
-    pub(crate) node_deltas: BTreeMap<Node, NodeDelta>,
+    pub(crate) node_deltas: BTreeMap<HoneyBee, NodeDelta>,
 }
 
 impl Serializable for Delta {
@@ -22,10 +22,10 @@ impl Serializable for Delta {
     }
 
     fn deserialize(buf: &mut &[u8]) -> anyhow::Result<Self> {
-        let mut node_deltas: BTreeMap<Node, NodeDelta> = Default::default();
+        let mut node_deltas: BTreeMap<HoneyBee, NodeDelta> = Default::default();
         let num_nodes = u16::deserialize(buf)?;
         for _ in 0..num_nodes {
-            let node = Node::deserialize(buf)?;
+            let node = HoneyBee::deserialize(buf)?;
             let node_delta = NodeDelta::deserialize(buf)?;
             node_deltas.insert(node, node_delta);
         }
@@ -61,7 +61,7 @@ pub struct DeltaWriter {
     delta: Delta,
     mtu: usize,
     num_bytes: usize,
-    current_node: Option<Node>,
+    current_node: Option<HoneyBee>,
     current_node_delta: NodeDelta,
     reached_capacity: bool,
 }
@@ -86,7 +86,7 @@ impl DeltaWriter {
         }
     }
 
-    pub fn add_node(&mut self, node: Node) -> bool {
+    pub fn add_node(&mut self, node: HoneyBee) -> bool {
         assert!(Some(&node) != self.current_node.as_ref());
         assert!(!self.delta.node_deltas.contains_key(&node));
         self.flush();

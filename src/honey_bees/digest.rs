@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::node::Node;
+use super::node::HoneyBee;
 use super::serialize::*;
 use super::Version;
 
@@ -9,12 +9,12 @@ use super::Version;
 ///
 /// It is equivalent to a map: peer -> max version.
 pub struct Digest {
-    pub(crate) node_max_version: BTreeMap<Node, Version>,
+    pub(crate) node_max_version: BTreeMap<HoneyBee, Version>,
 }
 
 impl Digest {
     #[cfg(test)]
-    pub fn add_node(&mut self, node: Node, max_version: Version) {
+    pub fn add_node(&mut self, node: HoneyBee, max_version: Version) {
         self.node_max_version.insert(node, max_version);
     }
 }
@@ -30,9 +30,9 @@ impl Serializable for Digest {
 
     fn deserialize(buf: &mut &[u8]) -> anyhow::Result<Self> {
         let num_nodes = u16::deserialize(buf)?;
-        let mut node_max_version: BTreeMap<Node, Version> = Default::default();
+        let mut node_max_version: BTreeMap<HoneyBee, Version> = Default::default();
         for _ in 0..num_nodes {
-            let node = Node::deserialize(buf)?;
+            let node = HoneyBee::deserialize(buf)?;
             let version = u64::deserialize(buf)?;
             node_max_version.insert(node, version);
         }

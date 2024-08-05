@@ -1,22 +1,21 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
-#[cfg(not(test))]
 use std::time::Instant;
 
-use super::node::Node;
+use super::node::HoneyBee;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 /// A phi accrual failure detector implementation.
 pub struct FailureDetector {
     /// Heartbeat samples for each node.
-    node_samples: HashMap<Node, SamplingWindow>,
+    node_samples: HashMap<HoneyBee, SamplingWindow>,
     /// Failure detector configuration.
     config: FailureDetectorConfig,
     /// Denotes live nodes.
-    live_nodes: HashSet<Node>,
+    live_nodes: HashSet<HoneyBee>,
     /// Denotes dead nodes.
-    dead_nodes: HashMap<Node, Instant>,
+    dead_nodes: HashMap<HoneyBee, Instant>,
 }
 
 impl FailureDetector {
@@ -30,7 +29,7 @@ impl FailureDetector {
     }
 
     /// Reports node heartbeat.
-    pub fn report_heartbeat(&mut self, node: &Node) {
+    pub fn report_heartbeat(&mut self, node: &HoneyBee) {
         debug!(node = ?node, "reporting node heartbeat.");
         let heartbeat_window = self
             .node_samples
@@ -46,16 +45,18 @@ impl FailureDetector {
     }
 
     /// Marks a node as dead or live.
-    pub fn update_node_liveliness(&mut self, node: &Node) {
+    pub fn update_node_liveliness(&mut self, node: &HoneyBee) {
         if let Some(phi) = self.phi(node) {
             debug!(node = ?node, phi = phi, "updating node liveliness");
             if phi > self.config.phi_threshold {
+                node.is_alive = false;
                 self.live_nodes.remove(node);
                 self.dead_nodes.insert(node.clone().into(), Instant::now());
                 // Remove current sampling window so that when the node
                 // comes back online, we start with a fresh sampling window.
                 self.node_samples.remove(node);
             } else {
+                node.is_alive = true;
                 self.live_nodes.insert(node.clone().into());
                 self.dead_nodes.remove(node);
             }
@@ -63,8 +64,8 @@ impl FailureDetector {
     }
 
     /// Removes and returns the list of garbage collectible nodes.
-    pub fn garbage_collect(&mut self) -> Vec<Node> {
-        let mut garbage_collected_nodes: Vec<Node> = Vec::new();
+    pub fn garbage_collect(&mut self) -> Vec<HoneyBee> {
+        let mut garbage_collected_nodes: Vec<HoneyBee> = Vec::new();
         for (node, instant) in self.dead_nodes.iter() {
             if instant.elapsed() >= self.config.dead_node_grace_period {
                 garbage_collected_nodes.push(node.clone().into())
@@ -78,15 +79,15 @@ impl FailureDetector {
         garbage_collected_nodes
     }
 
-    pub fn live_nodes(&self) -> impl Iterator<Item = &Node> {
+    pub fn live_nodes(&self) -> impl Iterator<Item = &HoneyBee> {
         self.live_nodes.iter()
     }
 
-    pub fn dead_nodes(&self) -> impl Iterator<Item = &Node> {
+    pub fn dead_nodes(&self) -> impl Iterator<Item = &HoneyBee> {
         self.dead_nodes.iter().map(|(node, _)| node)
     }
 
-    fn phi(&mut self, node: &Node) -> Option<f64> {
+    fn phi(&mut self, node: &HoneyBee) -> Option<f64> {
         self.node_samples
             .get(node)
             .map(|sampling_window| sampling_window.phi())

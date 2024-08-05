@@ -8,10 +8,10 @@ use tokio::sync::Mutex;
 use tonic::transport::Server;
 use tonic::{Code, Request, Response, Status};
 
-use homekv::gossip::failure_detector::FailureDetectorConfig;
-use homekv::gossip::server::spawn_gossip;
-use homekv::gossip::transport::UdpTransport;
-use homekv::gossip::{GossipConfig, Gossiper, Node};
+use homekv::honey_bees::failure_detector::FailureDetectorConfig;
+use homekv::honey_bees::server::spawn_gossip;
+use homekv::honey_bees::transport::UdpTransport;
+use homekv::honey_bees::{GossipConfig, HoneyBee, HoneyBees};
 use homekv::storage::Store;
 use homekv::storage::{BTreeStore, Mvcc};
 
@@ -45,15 +45,15 @@ impl StoreStatus {
 pub struct HomeKvServer {
     store: Mvcc<BTreeStore>,
     status: StoreStatus,
-    gossiper: Arc<Mutex<Gossiper>>,
+    honey_bees: Arc<Mutex<HoneyBees>>,
 }
 
 impl HomeKvServer {
-    pub fn with_gossiper(gossiper: Arc<Mutex<Gossiper>>) -> Self {
+    pub fn with_honey_bees(honey_bees: Arc<Mutex<HoneyBees>>) -> Self {
         HomeKvServer {
             store: Mvcc::new(BTreeStore::new()),
             status: StoreStatus::new(),
-            gossiper,
+            honey_bees,
         }
     }
 }
@@ -247,7 +247,7 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let addr = format!("{}:{}", args.host, args.port).parse()?;
-    let node = Node::new("default-node-1".to_string(), "127.0.0.1:8888");
+    let node = HoneyBee::new("default-node-1".to_string(), "127.0.0.1:8888");
     let config = GossipConfig {
         node,
         cluster_id: "testing".to_string(),
@@ -258,8 +258,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         is_ready_predicate: None,
     };
     let gossip_handler = spawn_gossip(config, Vec::new(), &UdpTransport).await?;
-    let gossiper = gossip_handler.gossiper();
-    let homekv = HomeKvServer::with_gossiper(gossiper);
+    let honey_bees = gossip_handler.honey_bees();
+    let homekv = HomeKvServer::with_honey_bees(honey_bees);
 
     Server::builder()
         .add_service(HomeKvServiceServer::new(homekv))

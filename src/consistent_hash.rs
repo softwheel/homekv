@@ -1,3 +1,4 @@
+use md5::{Digest, Md5};
 use std::collections::{BTreeMap, HashMap};
 
 use prost::Message;
@@ -150,4 +151,10 @@ where
 
         None
     }
+}
+
+pub fn md5_hash(data: &[u8]) -> Vec<u8> {
+    let mut digest = Md5::default();
+    digest.update(data);
+    digest.finalize().to_vec()
 }

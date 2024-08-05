@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use super::message::GossipMessage;
 use super::transport::{Socket, Transport};
-use super::{Command, GossipConfig, GossipHandle, Gossiper};
+use super::{Command, GossipConfig, GossipHandle, HoneyBees};
 
 /// Number of nodes picked for random gossip.
 const GOSSIP_COUNT: usize = 3;
@@ -102,7 +102,7 @@ pub async fn spawn_gossip(
         spawn_dns_refresh_loop(&config.seed_nodes).await;
     let socket = transport.open(config.listen_addr).await?;
     let node = config.node.clone();
-    let gossiper = Gossiper::with_node_id_and_seeds(config, seed_addrs, initial_key_values);
+    let gossiper = HoneyBees::with_node_id_and_seeds(config, seed_addrs, initial_key_values);
     let gossiper_arc = Arc::new(Mutex::new(gossiper));
     let gossiper_arc_clone = gossiper_arc.clone();
     let join_handle = tokio::spawn(async move {
@@ -115,14 +115,14 @@ pub async fn spawn_gossip(
     Ok(GossipHandle {
         node,
         command_tx,
-        gossiper: gossiper_arc,
+        honey_bees: gossiper_arc,
         join_handle,
     })
 }
 
 struct Server {
     command_rx: UnboundedReceiver<Command>,
-    gossiper: Arc<Mutex<Gossiper>>,
+    gossiper: Arc<Mutex<HoneyBees>>,
     transport: Box<dyn Socket>,
     rng: SmallRng,
 }
@@ -130,7 +130,7 @@ struct Server {
 impl Server {
     async fn new(
         command_rx: UnboundedReceiver<Command>,
-        gossiper: Arc<Mutex<Gossiper>>,
+        gossiper: Arc<Mutex<HoneyBees>>,
         transport: Box<dyn Socket>,
     ) -> Self {
         let rng = SmallRng::from_rng(thread_rng()).expect("Failed to seed random generator");

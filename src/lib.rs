@@ -1,4 +1,4 @@
 pub mod common;
 pub mod consistent_hash;
-pub mod gossip;
+pub mod honey_bees;
 pub mod storage;
