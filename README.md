@@ -1,4 +1,4 @@
-## HomeKV - Highly Optimized Memory Efficient Key Value Store
+## HOMEKV - Highly Optimized & Memory Efficient Key Value Store
 
 ### Basic
 HomeKV is a Rust key-value store which support Atomicity.
