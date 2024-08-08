@@ -1,11 +1,6 @@
 use md5::{Digest, Md5};
 use std::collections::{BTreeMap, HashMap};
 
-use prost::Message;
-
-// The pattern of virtual node id, which is like node_name-1
-pub const VIRTUAL_NODE_ID_PATTERN: &str = "{}-{}";
-
 pub type HashFunction = fn(&[u8]) -> Vec<u8>;
 
 pub trait ConsistentHashNode {
@@ -24,7 +19,7 @@ where
 
 impl<N> ConsistentHash<N>
 where
-    N: Node,
+    N: ConsistentHashNode,
 {
     pub fn new(node_replicas: Vec<(N, usize)>) -> Self {
         let ch = Self {
@@ -46,13 +41,13 @@ where
 
     fn init(mut self, node_replicas: Vec<(N, usize)>) -> Self {
         node_replicas.into_iter().for_each(|(node, n_replicas)| {
-            self.add(node, num_replicas);
+            self.add(node, n_replicas);
         });
         self
     }
 
-    fn get_vnode_key(self, node_name: &str, i: usize) -> Vec<u8> {
-        let virtual_node_id = format!(VIRTUAL_NODE_ID_PATTERN, node.name(), i);
+    fn get_vnode_key(&self, node_name: &str, i: usize) -> Vec<u8> {
+        let virtual_node_id = format!("{}-{}", node_name, i);
         (self.hash_func)(virtual_node_id.as_bytes())
     }
 
@@ -97,7 +92,7 @@ where
         self.get_with_tolerance(key, 0)
     }
 
-    pub fn get_with_tolerance(&self, key: &[u8], tolerance: usize) -> Option<N> {
+    pub fn get_with_tolerance(&self, key: &[u8], tolerance: usize) -> Option<&N> {
         self.get_position_key(key, tolerance)
             .and_then(move |position_key| {
                 self.virtual_nodes

@@ -27,7 +27,7 @@ async fn dns_refresh_loop(
     let mut interval = time::interval(DNS_POLLING_DURATION);
     // We actually do not want to run the polling loop right away, hence this tick.
     interval.tick().await;
-    while send_addrs_tx.receiver_count() > 0 {
+    while seed_addrs_tx.receiver_count() > 0 {
         interval.tick().await;
         let mut seed_addrs = seed_addrs_not_requiring_resolution.clone();
         for seed_host in &seed_hosts_requiring_dns {
@@ -199,7 +199,7 @@ impl Server {
             .map(|node| node.gossip_address)
             .collect::<HashSet<_>>();
         let seed_nodes: HashSet<SocketAddr> = gossiper_guard.seed_addrs();
-        let (selected_nodes, random_dead_node_opt, random_seed_node_opt) = select_nodes_for_gossip(
+        let (selected_nodes, random_dead_node_opt, random_seed_node_opt) = select_gossip_nodes(
             &mut self.rng,
             peer_nodes,
             live_nodes,
@@ -227,7 +227,7 @@ impl Server {
         }
 
         if let Some(random_seed_node) = random_seed_node_opt {
-            result = self.gossip(random_seed_node).await;
+            let result = self.gossip(random_seed_node).await;
             if result.is_err() {
                 error!(node = ?random_seed_node, "Gossip error with a seed node.")
             }
@@ -243,4 +243,66 @@ impl Server {
         self.transport.send(addr, syn).await?;
         Ok(())
     }
+}
+
+fn select_gossip_nodes<R>(
+    rng: &mut R,
+    peer_nodes: HashSet<SocketAddr>,
+    live_nodes: HashSet<SocketAddr>,
+    dead_nodes: HashSet<SocketAddr>,
+    seed_nodes: HashSet<SocketAddr>,
+) -> (Vec<SocketAddr>, Option<SocketAddr>, Option<SocketAddr>)
+where
+    R: Rng + ?Sized,
+{
+    let live_nodes_c = live_nodes.len();
+    let dead_nodes_c = dead_nodes.len();
+
+    // Select `GOSSIP_COUNT` number of live nodes.
+    // On startup, select from cluster nodes since we don't know any live node yet.
+    let nodes = if live_nodes_c == 0 {
+        peer_nodes
+    } else {
+        live_nodes
+    }
+    .iter()
+    .cloned()
+    .choose_multiple(rng, GOSSIP_COUNT);
+
+    // gossip with seed
+    let mut has_g_w_seed = false;
+    for node_id in &nodes {
+        if seed_nodes.contains(node_id) {
+            has_g_w_seed = true;
+            break;
+        }
+    }
+
+    let dead_node: Option<SocketAddr> =
+        select_random_node(rng, &dead_nodes, live_nodes_c, dead_nodes_c);
+    // Prevent from network partition caused by the count of seeds.
+    // see https://issues.apache.org/jira/browse/CASSANDRA-150
+    let seed_node: Option<SocketAddr> = if !has_g_w_seed || live_nodes_c < seed_nodes.len() {
+        select_random_node(rng, &seed_nodes, live_nodes_c, dead_nodes_c)
+    } else {
+        None
+    };
+
+    (nodes, dead_node, seed_node)
+}
+
+fn select_random_node<R>(
+    rng: &mut R,
+    nodes: &HashSet<SocketAddr>,
+    live_nodes_count: usize,
+    dead_nodes_count: usize,
+) -> Option<SocketAddr>
+where
+    R: Rng + ?Sized,
+{
+    let p = dead_nodes_count as f64 / (live_nodes_count + 1) as f64;
+    if p > rng.gen::<f64>() {
+        return nodes.iter().choose(rng).cloned();
+    }
+    None
 }

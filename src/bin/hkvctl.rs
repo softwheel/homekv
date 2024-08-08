@@ -1,7 +1,7 @@
 use homekv_service::home_kv_service_client::HomeKvServiceClient;
 use homekv_service::*;
 
-use clap::{ArgEnum, Parser};
+use clap::{Parser, Subcommand};
 use tonic::transport::Channel;
 
 pub mod homekv_service {
@@ -70,16 +70,17 @@ impl HomeKvClient {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ArgEnum)]
+#[derive(Subcommand)]
 enum CMD {
-    GET,
-    SET,
-    DEL,
+    GET { keys: Option<Vec<String>> },
+    SET { kvs: Option<Vec<String>> },
+    DEL { keys: Option<Vec<String>> },
     METRICS,
 }
 
-#[derive(Parser, Debug)]
-#[clap(author = "Haili Zhang", version = "0.1.0", about = "A Mem KV Store")]
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+#[command(propagate_version = true)]
 struct Args {
     /// Server Host
     #[clap(short, long, default_value_t= String::from("127.0.0.1"))]
@@ -91,16 +92,8 @@ struct Args {
     port: usize,
 
     /// Command: get, set, del
-    #[clap(short, long, arg_enum)]
+    #[command(subcommand)]
     cmd: CMD,
-
-    /// keys
-    #[clap(short, long, multiple_values = true)]
-    keys: Option<Vec<String>>,
-
-    /// key-value pairs
-    #[clap(long, multiple_values = true)]
-    kvs: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -114,11 +107,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("querying...");
     match args.cmd {
-        CMD::GET => {
-            println!("cmd: {:?}", args.cmd);
-
-            let keys = args.keys.unwrap();
-            println!("keys: {:?}", &keys);
+        CMD::GET { keys } => {
+            let keys = keys.expect("get command must have a list of keys!");
+            println!("get keys: {:?}", &keys);
 
             match home_kv_client.get(&mut conn, keys).await {
                 Ok(records) => {
@@ -139,35 +130,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => println!("Get runs in error: {:?}", e),
             }
         }
-        CMD::SET => {
-            println!("cmd: {:?}", args.cmd);
-
-            let kvs = args.kvs.unwrap();
-            println!("kvs: {:?}", &kvs);
+        CMD::SET { kvs } => {
+            let kvs = kvs.expect("set command must have a list of key-value pairs");
+            println!("set kvs: {:?}", &kvs);
 
             match home_kv_client.set(&mut conn, kvs).await {
                 Ok(succ) => println!("Set SUCCESS? {}", succ),
                 Err(e) => println!("Set runs in error: {:?}", e),
             }
         }
-        CMD::DEL => {
-            println!("cmd: {:?}", args.cmd);
-
-            let keys = args.keys.unwrap();
-            println!("keys: {:?}", &keys);
+        CMD::DEL { keys } => {
+            let keys = keys.expect("del command must have a list of keys!");
+            println!("del keys: {:?}", &keys);
 
             match home_kv_client.del(&mut conn, keys).await {
                 Ok(succ) => println!("Del SUCCESS? {}", succ),
                 Err(e) => println!("Del runs in error: {:?}", e),
             }
         }
-        CMD::METRICS => {
-            println!("cmd: {:?}", args.cmd);
-            match home_kv_client.metrics(&mut conn).await {
-                Ok(metrics) => println!("Metrics: {:?}", metrics),
-                Err(e) => println!("Metrics runs in error: {:?}", e),
-            }
-        }
+        CMD::METRICS => match home_kv_client.metrics(&mut conn).await {
+            Ok(metrics) => println!("Metrics: {:?}", metrics),
+            Err(e) => println!("Metrics runs in error: {:?}", e),
+        },
     }
     Ok(())
 }

@@ -1,7 +1,7 @@
 use crate::consistent_hash::ConsistentHashNode;
+use cool_id_generator::Size;
 
-use super::serialize::Serializable;
-use serde::Serialize;
+use super::serialize::HBSerializable;
 /// [`HoneyBee`] represents a node of a HoneyBees gossip cluster.
 ///
 /// For the lifetime of a cluster, nodes can go down and back up,
@@ -42,6 +42,7 @@ use serde::Serialize;
 /// fine.
 use std::net::SocketAddr;
 
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct HoneyBee {
     // The unique id of this node in the cluster.
     pub id: String,
@@ -51,20 +52,23 @@ pub struct HoneyBee {
     pub is_alive: u16,
 }
 
+fn generate_server_id(gossip_addr: SocketAddr) -> String {
+    let cool_id = cool_id_generator::get_id(Size::Medium);
+    format!("svr:{}-{}", gossip_addr, cool_id)
+}
+
 impl HoneyBee {
-    pub fn new(id: String, gossip_address: SocketAddr) -> Self {
+    pub fn new(gossip_address: SocketAddr) -> Self {
         Self {
-            id,
+            id: generate_server_id(gossip_address),
             gossip_address,
             is_alive: 1,
         }
     }
 
     pub fn with_localhost_port(port: u16) -> Self {
-        HoneyBee::new(
-            format!("node-{port}"),
-            ([127u8, 0u8, 0u8, 1u8], port).into(),
-        )
+        let gossip_address = format!("127.0.0.1:{}", port).parse().unwrap();
+        HoneyBee::new(gossip_address)
     }
 
     #[cfg(test)]
@@ -73,7 +77,7 @@ impl HoneyBee {
     }
 }
 
-impl Serializable for HoneyBee {
+impl HBSerializable for HoneyBee {
     fn serialize(&self, buf: &mut Vec<u8>) {
         self.id.serialize(buf);
         self.gossip_address.serialize(buf);

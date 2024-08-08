@@ -1,6 +1,6 @@
-use log::Level::Debug;
+use rand::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::Entry;
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::net::SocketAddr;
 use tokio::sync::watch;
@@ -126,7 +126,7 @@ impl ClusterState {
 
     pub(crate) fn apply_delta(&mut self, delta: Delta) {
         for (node, node_delta) in delta.node_deltas {
-            let mut node_state_map = self
+            let node_state_map = self
                 .node_states
                 .entry(node)
                 .or_insert_with(NodeState::default);
@@ -165,7 +165,12 @@ impl ClusterState {
     }
 
     /// Implements the scuttlebutt reconciliation with the scuttle-depth ordering.
-    pub fn compute_delta(&self, digest: &Digest, mtu: usize, dead_nodes: HashSet<&HoneyBee>) -> Delta {
+    pub fn compute_delta(
+        &self,
+        digest: &Digest,
+        mtu: usize,
+        dead_nodes: HashSet<&HoneyBee>,
+    ) -> Delta {
         let mut delta_writer = DeltaWriter::with_mtu(mtu);
 
         let mut node_sorted_by_stale_length = NodeSortedByStaleLength::default();
@@ -219,18 +224,13 @@ impl<'a> NodeSortedByStaleLength<'a> {
     }
 
     fn into_iter(mut self) -> impl Iterator<Item = &'a HoneyBee> {
-        let mut rng = random_generator();
+        let mut rng = SmallRng::from_rng(thread_rng()).expect("Failed to seed random generator");
         std::iter::from_fn(move || self.stale_lengths.pop()).flat_map(move |length| {
             let mut nodes = self.node_per_stale_length.remove(&length).unwrap();
             nodes.shuffle(&mut rng);
             nodes.into_iter()
         })
     }
-}
-
-#[cfg(not(test))]
-fn random_generator() -> impl Rng {
-    rand::thread_rng()
 }
 
 #[derive(Serialize, Deserialize, Debug)]

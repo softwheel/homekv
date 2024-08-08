@@ -1,10 +1,10 @@
-use crate::gossip::serialize::Serializable;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use tracing::warn;
 
 use super::message::GossipMessage;
+use super::serialize::HBSerializable;
 use super::MTU;
 
 #[async_trait]

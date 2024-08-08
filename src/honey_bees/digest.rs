@@ -19,7 +19,7 @@ impl Digest {
     }
 }
 
-impl Serializable for Digest {
+impl HBSerializable for Digest {
     fn serialize(&self, buf: &mut Vec<u8>) {
         (self.node_max_version.len() as u16).serialize(buf);
         for (node, version) in &self.node_max_version {
@@ -41,7 +41,7 @@ impl Serializable for Digest {
 
     fn serialized_len(&self) -> usize {
         let mut len = (self.node_max_version.len() as u16).serialized_len();
-        for (node, version) in &self.node_max_version {
+        for (node, _) in &self.node_max_version {
             len += node.serialized_len();
             len += node.serialized_len();
         }

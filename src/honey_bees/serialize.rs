@@ -1,18 +1,14 @@
-use serde::Serialize;
-use std::io::BufRead;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::io::AsyncBufReadExt;
 
 use anyhow::{bail, Context};
-
-use super::node::HoneyBee;
 
 /// Trait for serializing messages.
 ///
 /// HomeTalk uses a custom binary serialization format.
 /// The point of this format is to make it possible to truncate
 /// the delta payload to a given mtu.
-pub trait Serializable: Sized {
+pub trait HBSerializable: Sized {
     fn serialize(&self, buf: &mut Vec<u8>);
     fn serialize_to_vec(&self) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -23,13 +19,13 @@ pub trait Serializable: Sized {
     fn serialized_len(&self) -> usize;
 }
 
-impl Serializable for u16 {
+impl HBSerializable for u16 {
     fn serialize(&self, buf: &mut Vec<u8>) {
         let _ = self.to_le_bytes().serialize(buf);
     }
 
     fn deserialize(buf: &mut &[u8]) -> anyhow::Result<Self> {
-        let u16_bytes: [u8; 2] = Serializable::deserialize(buf)?;
+        let u16_bytes: [u8; 2] = HBSerializable::deserialize(buf)?;
         Ok(Self::from_le_bytes(u16_bytes))
     }
 
@@ -38,13 +34,13 @@ impl Serializable for u16 {
     }
 }
 
-impl Serializable for u64 {
+impl HBSerializable for u64 {
     fn serialize(&self, buf: &mut Vec<u8>) {
         let _ = self.to_le_bytes().serialize(buf);
     }
 
     fn deserialize(buf: &mut &[u8]) -> anyhow::Result<Self> {
-        let u64_bytes: [u8; 8] = Serializable::deserialize(buf)?;
+        let u64_bytes: [u8; 8] = HBSerializable::deserialize(buf)?;
         Ok(Self::from_le_bytes(u64_bytes))
     }
 
@@ -73,7 +69,7 @@ impl TryFrom<u8> for IpVersion {
     }
 }
 
-impl Serializable for IpAddr {
+impl HBSerializable for IpAddr {
     fn serialize(&self, buf: &mut Vec<u8>) {
         match self {
             IpAddr::V4(ip_v4) => {
@@ -96,11 +92,11 @@ impl Serializable for IpAddr {
         buf.consume(1);
         match ip_version {
             IpVersion::V4 => {
-                let bytes: [u8; 4] = Serializable::deserialize(buf)?;
+                let bytes: [u8; 4] = HBSerializable::deserialize(buf)?;
                 Ok(Ipv4Addr::from(bytes).into())
             }
             IpVersion::V6 => {
-                let bytes: [u8; 16] = Serializable::deserialize(buf)?;
+                let bytes: [u8; 16] = HBSerializable::deserialize(buf)?;
                 Ok(Ipv6Addr::from(bytes).into())
             }
         }
@@ -114,7 +110,7 @@ impl Serializable for IpAddr {
     }
 }
 
-impl Serializable for String {
+impl HBSerializable for String {
     fn serialize(&self, buf: &mut Vec<u8>) {
         let _ = (self.len() as u16).serialize(buf);
         buf.extend(self.as_bytes())
@@ -132,7 +128,7 @@ impl Serializable for String {
     }
 }
 
-impl<const N: usize> Serializable for [u8; N] {
+impl<const N: usize> HBSerializable for [u8; N] {
     fn serialize(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self[..]);
     }
@@ -151,7 +147,7 @@ impl<const N: usize> Serializable for [u8; N] {
     }
 }
 
-impl Serializable for SocketAddr {
+impl HBSerializable for SocketAddr {
     fn serialize(&self, buf: &mut Vec<u8>) {
         let _ = self.ip().serialize(buf);
         let _ = self.port().serialize(buf);

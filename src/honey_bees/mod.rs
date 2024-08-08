@@ -17,11 +17,12 @@ use std::collections::HashSet;
 use std::iter::Iterator;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::WatchStream;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 pub use configuration::GossipConfig;
 pub use delta::Delta;
@@ -108,7 +109,7 @@ impl HoneyBees {
     fn compute_digset(&mut self) -> Digest {
         // Ensure for every reply from this node, at least the heartbeat
         // is changed.
-        let dead_nodes: HashSet<_> = self.dead_nodes().collect();
+        let dead_nodes = self.dead_nodes().collect::<HashSet<_>>();
         self.cluster_state.compute_digest(dead_nodes)
     }
 
@@ -122,7 +123,7 @@ impl HoneyBees {
                     );
                     return Some(GossipMessage::BadCluster);
                 }
-                let self_digest = self.compute_digest();
+                let self_digest = self.compute_digset();
                 let dead_nodes = self.dead_nodes().collect::<HashSet<_>>();
                 let empty_delta = Delta::default();
                 let delta_mtu = MTU - syn_ack_serialized_len(&self_digest, &empty_delta);
@@ -185,14 +186,14 @@ impl HoneyBees {
         let ready_nodes_before = self.ready_nodes_watcher_rx.borrow().clone();
         let ready_nodes_after = self.ready_nodes().cloned().collect::<HashSet<_>>();
         if ready_nodes_before != ready_nodes_after {
-            debub!(
+            debug!(
                 current_node = ?self.self_node(),
                 live_nodes = ?ready_nodes_after,
                 "nodes status changed"
             );
             if self.ready_nodes_watcher_tx.send(ready_nodes_after).is_err() {
                 error!(
-                    current_node = ?self.self_node_id(),
+                    current_node = ?self.self_node(),
                     "error while reporting membership change event."
                 )
             }
@@ -270,7 +271,7 @@ enum Command {
     Shutdown,
 }
 
-struct GossipHandle {
+pub struct GossipHandle {
     node: HoneyBee,
     command_tx: UnboundedSender<Command>,
     honey_bees: Arc<Mutex<HoneyBees>>,
@@ -284,14 +285,6 @@ impl GossipHandle {
 
     pub fn honey_bees(&self) -> Arc<Mutex<HoneyBees>> {
         self.honey_bees.clone()
-    }
-
-    pub async fn with_honey_bees<F, T>(&self, mut fun: F) -> T
-    where
-        F: FnMut(&mut HoneyBees) -> T,
-    {
-        let mut honey_bees = self.honey_bees.lock().await;
-        fun(&mut honey_bees)
     }
 
     pub async fn shutdown(self) -> Result<(), anyhow::Error> {

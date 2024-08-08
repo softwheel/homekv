@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::mem;
 
 use anyhow;
+use serde_derive::Serialize;
 
 use super::node::HoneyBee;
 use super::serialize::*;
@@ -12,7 +13,7 @@ pub struct Delta {
     pub(crate) node_deltas: BTreeMap<HoneyBee, NodeDelta>,
 }
 
-impl Serializable for Delta {
+impl HBSerializable for Delta {
     fn serialize(&self, buf: &mut Vec<u8>) {
         (self.node_deltas.len() as u16).serialize(buf);
         for (node, node_delta) in &self.node_deltas {
@@ -133,7 +134,7 @@ impl From<DeltaWriter> for Delta {
     }
 }
 
-impl Serializable for NodeDelta {
+impl HBSerializable for NodeDelta {
     fn serialize(&self, buf: &mut Vec<u8>) {
         (self.key_values.len() as u16).serialize(buf);
         for (key, VersionedValue { value, version }) in &self.key_values {

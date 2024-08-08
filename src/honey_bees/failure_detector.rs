@@ -49,14 +49,12 @@ impl FailureDetector {
         if let Some(phi) = self.phi(node) {
             debug!(node = ?node, phi = phi, "updating node liveliness");
             if phi > self.config.phi_threshold {
-                node.is_alive = false;
                 self.live_nodes.remove(node);
                 self.dead_nodes.insert(node.clone().into(), Instant::now());
                 // Remove current sampling window so that when the node
                 // comes back online, we start with a fresh sampling window.
                 self.node_samples.remove(node);
             } else {
-                node.is_alive = true;
                 self.live_nodes.insert(node.clone().into());
                 self.dead_nodes.remove(node);
             }
@@ -153,7 +151,7 @@ struct SamplingWindow {
 impl SamplingWindow {
     pub fn new(window_size: usize, max_interval: Duration, initial_interval: Duration) -> Self {
         Self {
-            intervals: BoundedArrayStats::new(window_size),
+            intervals: BoundedArrayStates::new(window_size),
             last_heartbeat: None,
             max_interval,
             initial_interval,
@@ -183,7 +181,7 @@ impl SamplingWindow {
 
 /// An array that retains a fixed number of streaming values.
 #[derive(Debug)]
-struct BoundedArrayStats {
+struct BoundedArrayStates {
     /// The values
     data: Vec<f64>,
     /// Number of accumulated values.
@@ -197,7 +195,7 @@ struct BoundedArrayStats {
     mean: f64,
 }
 
-impl BoundedArrayStats {
+impl BoundedArrayStates {
     pub fn new(size: usize) -> Self {
         Self {
             data: vec![0.0; size],

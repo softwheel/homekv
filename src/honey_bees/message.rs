@@ -1,9 +1,9 @@
-use serde::Serialize;
+use anyhow::Context;
 use std::io::BufRead;
 
 use super::delta::Delta;
 use super::digest::Digest;
-use super::serialize::Serializable;
+use super::serialize::HBSerializable;
 
 /// Gossip message.
 ///
@@ -11,7 +11,6 @@ use super::serialize::Serializable;
 /// node A and node B.
 /// The names {Syn, SynAck, Ack} of steps are borrowed from
 /// TCP Handshake.
-#[derive(Debug, PartialEq)]
 pub enum GossipMessage {
     /// Node A initiates handshakes.
     Syn { cluster_id: String, digest: Digest },
@@ -52,18 +51,18 @@ impl MessageType {
     }
 }
 
-impl Serializable for GossipMessage {
+impl HBSerializable for GossipMessage {
     fn serialize(&self, buf: &mut Vec<u8>) {
         match self {
             GossipMessage::Syn { cluster_id, digest } => {
-                buf.push(MessageType::Syn.to_code);
+                buf.push(MessageType::Syn.to_code());
                 digest.serialize(buf);
                 cluster_id.serialize(buf);
             }
             GossipMessage::SynAck { digest, delta } => {
                 buf.push(MessageType::SynAck.to_code());
                 digest.serialize(buf);
-                delta.serizlize(buf);
+                delta.serialize(buf);
             }
             GossipMessage::Ack { delta } => {
                 buf.push(MessageType::Ack.to_code());
