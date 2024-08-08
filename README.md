@@ -17,6 +17,7 @@ more complicated and can not be done in a short time.
 
 ### WIP: Making HomeKV a distributed system for large-scale data.
 * Built-in Service Discovery - [Gossip](https://www.cs.cornell.edu/home/rvr/papers/flowgossip.pdf) & [Phi Accrual Failure Detector](https://www.researchgate.net/publication/29682135_The_ph_accrual_failure_detector)
+* Efficiently Distributing Keys - [Consistent Hashing](https://www.geeksforgeeks.org/consistent-hashing/)
 * Replication Strong Consistence - [Raft](https://raft.github.io/raft.pdf)
 * More Storage Types - [Fragmented LSM](https://www.cs.utexas.edu/~rak/papers/sosp17-pebblesdb.pdf)
 

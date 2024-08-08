@@ -1,6 +1,6 @@
-use log::Level::Debug;
+use rand::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::Entry;
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::net::SocketAddr;
 use tokio::sync::watch;
@@ -8,7 +8,7 @@ use tokio::time::Instant;
 
 use super::delta::{Delta, DeltaWriter};
 use super::digest::Digest;
-use super::node::Node;
+use super::node::HoneyBee;
 use super::{Version, VersionedValue};
 
 /// Maximum value size (in bytes) for a key-value item.
@@ -82,7 +82,7 @@ impl NodeState {
 
 #[derive(Debug)]
 pub(crate) struct ClusterState {
-    pub(crate) node_states: BTreeMap<Node, NodeState>,
+    pub(crate) node_states: BTreeMap<HoneyBee, NodeState>,
     seed_addrs: watch::Receiver<HashSet<SocketAddr>>,
 }
 
@@ -104,15 +104,15 @@ impl ClusterState {
         }
     }
 
-    pub(crate) fn node_state_mut(&mut self, node: &Node) -> &mut NodeState {
+    pub(crate) fn node_state_mut(&mut self, node: &HoneyBee) -> &mut NodeState {
         self.node_states.entry(node.clone()).or_default()
     }
 
-    pub fn node_state(&self, node: &Node) -> Option<&NodeState> {
+    pub fn node_state(&self, node: &HoneyBee) -> Option<&NodeState> {
         self.node_states.get(node)
     }
 
-    pub fn nodes(&self) -> impl Iterator<Item = &Node> {
+    pub fn nodes(&self) -> impl Iterator<Item = &HoneyBee> {
         self.node_states.keys()
     }
 
@@ -120,13 +120,13 @@ impl ClusterState {
         self.seed_addrs.borrow().clone()
     }
 
-    pub(crate) fn remove_node(&mut self, node: &Node) {
+    pub(crate) fn remove_node(&mut self, node: &HoneyBee) {
         self.node_states.remove(node);
     }
 
     pub(crate) fn apply_delta(&mut self, delta: Delta) {
         for (node, node_delta) in delta.node_deltas {
-            let mut node_state_map = self
+            let node_state_map = self
                 .node_states
                 .entry(node)
                 .or_insert_with(NodeState::default);
@@ -153,7 +153,7 @@ impl ClusterState {
         }
     }
 
-    pub fn compute_digest(&self, dead_nodes: HashSet<&Node>) -> Digest {
+    pub fn compute_digest(&self, dead_nodes: HashSet<&HoneyBee>) -> Digest {
         Digest {
             node_max_version: self
                 .node_states
@@ -165,7 +165,12 @@ impl ClusterState {
     }
 
     /// Implements the scuttlebutt reconciliation with the scuttle-depth ordering.
-    pub fn compute_delta(&self, digest: &Digest, mtu: usize, dead_nodes: HashSet<&Node>) -> Delta {
+    pub fn compute_delta(
+        &self,
+        digest: &Digest,
+        mtu: usize,
+        dead_nodes: HashSet<&HoneyBee>,
+    ) -> Delta {
         let mut delta_writer = DeltaWriter::with_mtu(mtu);
 
         let mut node_sorted_by_stale_length = NodeSortedByStaleLength::default();
@@ -203,12 +208,12 @@ impl ClusterState {
 
 #[derive(Default)]
 struct NodeSortedByStaleLength<'a> {
-    node_per_stale_length: BTreeMap<usize, Vec<&'a Node>>,
+    node_per_stale_length: BTreeMap<usize, Vec<&'a HoneyBee>>,
     stale_lengths: BinaryHeap<usize>,
 }
 
 impl<'a> NodeSortedByStaleLength<'a> {
-    fn insert(&mut self, node: &'a Node, stale_length: usize) {
+    fn insert(&mut self, node: &'a HoneyBee, stale_length: usize) {
         self.node_per_stale_length
             .entry(stale_length)
             .or_insert_with(|| {
@@ -218,19 +223,14 @@ impl<'a> NodeSortedByStaleLength<'a> {
             .push(node)
     }
 
-    fn into_iter(mut self) -> impl Iterator<Item = &'a Node> {
-        let mut rng = random_generator();
+    fn into_iter(mut self) -> impl Iterator<Item = &'a HoneyBee> {
+        let mut rng = SmallRng::from_rng(thread_rng()).expect("Failed to seed random generator");
         std::iter::from_fn(move || self.stale_lengths.pop()).flat_map(move |length| {
             let mut nodes = self.node_per_stale_length.remove(&length).unwrap();
             nodes.shuffle(&mut rng);
             nodes.into_iter()
         })
     }
-}
-
-#[cfg(not(test))]
-fn random_generator() -> impl Rng {
-    rand::thread_rng()
 }
 
 #[derive(Serialize, Deserialize, Debug)]

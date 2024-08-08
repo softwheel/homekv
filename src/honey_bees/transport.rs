@@ -1,10 +1,10 @@
-use crate::gossip::serialize::Serializable;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use tracing::warn;
 
 use super::message::GossipMessage;
+use super::serialize::HBSerializable;
 use super::MTU;
 
 #[async_trait]
@@ -12,6 +12,7 @@ pub trait Transport: Send + Sync + 'static {
     async fn open(&self, listen_addr: SocketAddr) -> anyhow::Result<Box<dyn Socket>>;
 }
 
+#[async_trait]
 pub trait Socket: Send + Sync + 'static {
     async fn send(&mut self, to: SocketAddr, msg: GossipMessage) -> anyhow::Result<()>;
     async fn recv(&mut self) -> anyhow::Result<(SocketAddr, GossipMessage)>;

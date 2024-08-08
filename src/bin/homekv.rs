@@ -3,15 +3,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atomic_counter::{AtomicCounter, RelaxedCounter};
-use clap::Parser;
+use structopt::StructOpt;
 use tokio::sync::Mutex;
 use tonic::transport::Server;
 use tonic::{Code, Request, Response, Status};
 
-use homekv::gossip::failure_detector::FailureDetectorConfig;
-use homekv::gossip::server::spawn_gossip;
-use homekv::gossip::transport::UdpTransport;
-use homekv::gossip::{GossipConfig, Gossiper, Node};
+use homekv::honey_bees::failure_detector::FailureDetectorConfig;
+use homekv::honey_bees::server::spawn_gossip;
+use homekv::honey_bees::transport::UdpTransport;
+use homekv::honey_bees::{GossipConfig, HoneyBee, HoneyBees};
 use homekv::storage::Store;
 use homekv::storage::{BTreeStore, Mvcc};
 
@@ -41,19 +41,18 @@ impl StoreStatus {
     }
 }
 
-#[derive(Debug)]
 pub struct HomeKvServer {
     store: Mvcc<BTreeStore>,
     status: StoreStatus,
-    gossiper: Arc<Mutex<Gossiper>>,
+    honey_bees: Arc<Mutex<HoneyBees>>,
 }
 
 impl HomeKvServer {
-    pub fn with_gossiper(gossiper: Arc<Mutex<Gossiper>>) -> Self {
+    pub fn with_honey_bees(honey_bees: Arc<Mutex<HoneyBees>>) -> Self {
         HomeKvServer {
             store: Mvcc::new(BTreeStore::new()),
             status: StoreStatus::new(),
-            gossiper,
+            honey_bees,
         }
     }
 }
@@ -230,40 +229,55 @@ impl HomeKvService for HomeKvServer {
     }
 }
 
-#[derive(Parser, Debug)]
-#[clap(author = "Haili Zhang", version = "0.1.0", about = "A Mem KV Store")]
-struct Args {
-    /// Server Host
-    #[clap(short, long, default_value_t = String::from("127.0.0.1"))]
+#[derive(Debug, StructOpt)]
+#[structopt(
+    name = "HOMEKV Server",
+    about = "Highly Optimized Memory Efficient KV Store"
+)]
+struct Opt {
+    // Defines the server host
+    #[structopt(long = "host", default_value = "127.0.0.1")]
     host: String,
-
-    /// Server Port
-    /// FixMe: Add a CONST for default port
-    #[clap(short, long, default_value_t = 20001)]
-    port: usize,
+    // Defines the server port
+    #[structopt(long = "port", default_value = "20001")]
+    port: u32,
+    // Defines the public host, which other servers will use to
+    // reach to this server.
+    #[structopt(long = "public_host")]
+    public_host: String,
+    // Defines the gossip port
+    #[structopt(long = "gossip_port", default_value = "20002")]
+    gossip_port: u32,
+    // Defines the seed nodes list for gossip
+    #[structopt(long = "gossip_seeds", default_value = "")]
+    gossip_seeds: Vec<String>,
+    // Defines the gossip sync interval
+    #[structopt(long = "gossip_interval", default_value = "500")]
+    gossip_interval: u64,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-    let addr = format!("{}:{}", args.host, args.port).parse()?;
-    let node = Node::new("default-node-1".to_string(), "127.0.0.1:8888");
+    let opt = Opt::from_args();
+    let server_addr = format!("{}:{}", opt.host, opt.port).parse()?;
+    let gossip_addr = format!("{}:{}", opt.public_host, opt.gossip_port).parse()?;
+    let node = HoneyBee::new(gossip_addr);
     let config = GossipConfig {
         node,
-        cluster_id: "testing".to_string(),
-        gossip_interval: Duration::from_millis(opt.interval),
-        listen_addr: opt.listen_addr,
-        seed_nodes: opt.seeds.clone(),
+        cluster_id: "HOMEKV-1".to_string(),
+        gossip_interval: Duration::from_millis(opt.gossip_interval),
+        listen_addr: gossip_addr,
+        seed_nodes: opt.gossip_seeds.clone(),
         failure_detector_config: FailureDetectorConfig::default(),
         is_ready_predicate: None,
     };
     let gossip_handler = spawn_gossip(config, Vec::new(), &UdpTransport).await?;
-    let gossiper = gossip_handler.gossiper();
-    let homekv = HomeKvServer::with_gossiper(gossiper);
+    let honey_bees = gossip_handler.honey_bees();
+    let homekv = HomeKvServer::with_honey_bees(honey_bees);
 
     Server::builder()
         .add_service(HomeKvServiceServer::new(homekv))
-        .serve(addr)
+        .serve(server_addr)
         .await?;
 
     Ok(())

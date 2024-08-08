@@ -17,18 +17,19 @@ use std::collections::HashSet;
 use std::iter::Iterator;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::WatchStream;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 pub use configuration::GossipConfig;
 pub use delta::Delta;
 pub use digest::Digest;
 pub use failure_detector::FailureDetector;
 use message::{syn_ack_serialized_len, GossipMessage};
-pub use node::Node;
+pub use node::HoneyBee;
 use state::ClusterState;
 pub use state::{ClusterStateSnapshot, NodeState};
 
@@ -54,16 +55,16 @@ pub struct VersionedValue {
     pub version: Version,
 }
 
-pub struct Gossiper {
+pub struct HoneyBees {
     config: GossipConfig,
     cluster_state: ClusterState,
     heartbeat: u64,
     failure_detector: FailureDetector,
-    ready_nodes_watcher_tx: watch::Sender<HashSet<Node>>,
-    ready_nodes_watcher_rx: watch::Receiver<HashSet<Node>>,
+    ready_nodes_watcher_tx: watch::Sender<HashSet<HoneyBee>>,
+    ready_nodes_watcher_rx: watch::Receiver<HashSet<HoneyBee>>,
 }
 
-impl Gossiper {
+impl HoneyBees {
     pub fn with_node_id_and_seeds(
         config: GossipConfig,
         seed_addrs: watch::Receiver<HashSet<SocketAddr>>,
@@ -71,7 +72,7 @@ impl Gossiper {
     ) -> Self {
         let (ready_nodes_watcher_tx, ready_nodes_watcher_rx) = watch::channel(HashSet::new());
         let failure_detector = FailureDetector::new(config.failure_detector_config.clone());
-        let mut gossiper = Gossiper {
+        let mut honey_bees = HoneyBees {
             config,
             cluster_state: ClusterState::with_seed_addrs(seed_addrs),
             heartbeat: 0,
@@ -80,7 +81,7 @@ impl Gossiper {
             ready_nodes_watcher_rx,
         };
 
-        let self_node_state = gossiper.self_node_state();
+        let self_node_state = honey_bees.self_node_state();
 
         // Instantly mark node as alive to ensure it responds to SYNs.
         self_node_state.set(HEARTBEAT_KEY, 0);
@@ -89,7 +90,7 @@ impl Gossiper {
             self_node_state.set(key, value);
         }
 
-        gossiper
+        honey_bees
     }
 
     pub fn create_syn_message(&mut self) -> GossipMessage {
@@ -108,7 +109,7 @@ impl Gossiper {
     fn compute_digset(&mut self) -> Digest {
         // Ensure for every reply from this node, at least the heartbeat
         // is changed.
-        let dead_nodes: HashSet<_> = self.dead_nodes().collect();
+        let dead_nodes = self.dead_nodes().collect::<HashSet<_>>();
         self.cluster_state.compute_digest(dead_nodes)
     }
 
@@ -122,7 +123,7 @@ impl Gossiper {
                     );
                     return Some(GossipMessage::BadCluster);
                 }
-                let self_digest = self.compute_digest();
+                let self_digest = self.compute_digset();
                 let dead_nodes = self.dead_nodes().collect::<HashSet<_>>();
                 let empty_delta = Delta::default();
                 let delta_mtu = MTU - syn_ack_serialized_len(&self_digest, &empty_delta);
@@ -185,14 +186,14 @@ impl Gossiper {
         let ready_nodes_before = self.ready_nodes_watcher_rx.borrow().clone();
         let ready_nodes_after = self.ready_nodes().cloned().collect::<HashSet<_>>();
         if ready_nodes_before != ready_nodes_after {
-            debub!(
+            debug!(
                 current_node = ?self.self_node(),
                 live_nodes = ?ready_nodes_after,
                 "nodes status changed"
             );
             if self.ready_nodes_watcher_tx.send(ready_nodes_after).is_err() {
                 error!(
-                    current_node = ?self.self_node_id(),
+                    current_node = ?self.self_node(),
                     "error while reporting membership change event."
                 )
             }
@@ -205,7 +206,7 @@ impl Gossiper {
         }
     }
 
-    pub fn node_state(&self, node: &Node) -> Option<&NodeState> {
+    pub fn node_state(&self, node: &HoneyBee) -> Option<&NodeState> {
         self.cluster_state.node_state(node)
     }
 
@@ -213,11 +214,11 @@ impl Gossiper {
         self.cluster_state.node_state_mut(&self.config.node)
     }
 
-    fn live_nodes(&self) -> impl Iterator<Item = &Node> {
+    fn live_nodes(&self) -> impl Iterator<Item = &HoneyBee> {
         self.failure_detector.live_nodes()
     }
 
-    fn ready_nodes(&self) -> impl Iterator<Item = &Node> {
+    fn ready_nodes(&self) -> impl Iterator<Item = &HoneyBee> {
         self.live_nodes().filter(|node| {
             let is_ready_pred = if let Some(pred) = self.config.is_ready_predicate.as_ref() {
                 pred
@@ -229,7 +230,7 @@ impl Gossiper {
         })
     }
 
-    fn dead_nodes(&self) -> impl Iterator<Item = &Node> {
+    fn dead_nodes(&self) -> impl Iterator<Item = &HoneyBee> {
         self.failure_detector.dead_nodes()
     }
 
@@ -237,7 +238,7 @@ impl Gossiper {
         self.cluster_state.seed_addrs()
     }
 
-    fn self_node(&self) -> &Node {
+    fn self_node(&self) -> &HoneyBee {
         &self.config.node
     }
 
@@ -259,7 +260,7 @@ impl Gossiper {
         ClusterStateSnapshot::from(&self.cluster_state)
     }
 
-    fn ready_nodes_watcher(&self) -> WatchStream<HashSet<Node>> {
+    fn ready_nodes_watcher(&self) -> WatchStream<HashSet<HoneyBee>> {
         WatchStream::new(self.ready_nodes_watcher_rx.clone())
     }
 }
@@ -270,28 +271,20 @@ enum Command {
     Shutdown,
 }
 
-struct GossipHandle {
-    node: Node,
+pub struct GossipHandle {
+    node: HoneyBee,
     command_tx: UnboundedSender<Command>,
-    gossiper: Arc<Mutex<Gossiper>>,
+    honey_bees: Arc<Mutex<HoneyBees>>,
     join_handle: JoinHandle<Result<(), anyhow::Error>>,
 }
 
 impl GossipHandle {
-    pub fn node(&self) -> &Node {
+    pub fn node(&self) -> &HoneyBee {
         &self.node
     }
 
-    pub fn gossiper(&self) -> Arc<Mutex<Gossiper>> {
-        self.gossiper.clone()
-    }
-
-    pub async fn with_gossiper<F, T>(&self, mut fun: F) -> T
-    where
-        F: FnMut(&mut Gossiper) -> T,
-    {
-        let mut gossiper = self.gossiper.lock().await;
-        fun(&mut gossiper)
+    pub fn honey_bees(&self) -> Arc<Mutex<HoneyBees>> {
+        self.honey_bees.clone()
     }
 
     pub async fn shutdown(self) -> Result<(), anyhow::Error> {
