@@ -1,112 +1,140 @@
-## HOMEKV - Highly Optimized & Memory Efficient Key Value Store
+# HomeKV
 
-### Basic
-HomeKV is a Rust key-value store which support Atomicity.
-Atomicity is implemented by a MVCC storage, which also make Reading
-and Writing don't block each other so that they can run in parallel.
+**HomeKV is a memory-first, strongly consistent distributed key-value database focused on predictable low latency, high throughput, and rigorous failure semantics.**
 
-The core MVCC storage of HomeKV acts as `RWLock<T>`, but it's better.
-Because writes and multiple reads can be performed simultaneously,
-which means they are not block each other to reduce contention.
+The project started as an in-memory Rust KV store with copy-on-write MVCC, gossip-based membership, a phi-accrual failure detector, and consistent hashing. The next generation of HomeKV is intentionally more database-centric: shard-local execution, replicated state machines, durable consensus, explicit consistency contracts, and reproducible performance engineering.
 
-To make the implementation easier, HomeKV only use the BTreeMap in
-Rust standard lib. The drawback of it is that MVCC needs to clone
-the whole tree to maintain multiple versions. An improvement could
-be change the underlying data structure to B+Tree. But it will be
-more complicated and can not be done in a short time.
+## North star
 
-### WIP: Making HomeKV a distributed system for large-scale data.
-* Built-in Service Discovery - [Gossip](https://www.cs.cornell.edu/home/rvr/papers/flowgossip.pdf) & [Phi Accrual Failure Detector](https://www.researchgate.net/publication/29682135_The_ph_accrual_failure_detector)
-* Efficiently Distributing Keys - [Consistent Hashing](https://www.geeksforgeeks.org/consistent-hashing/)
-* Replication Strong Consistence - [Raft](https://raft.github.io/raft.pdf)
-* More Storage Types - [Fragmented LSM](https://www.cs.utexas.edu/~rak/papers/sosp17-pebblesdb.pdf)
+HomeKV aims to explore the same class of systems problems that appear in high-performance managed in-memory databases:
 
-### Server Concurrency Model
-HomeKV uses Rust Tonic as the GRPC package, which handles concurrent requests
-in Asynchronous Programming way to achieve high performance.
+- sub-millisecond in-memory reads on the healthy-path
+- linearizable writes and strongly consistent reads
+- partitioned scale-out with independent replication groups
+- durable replicated commit before acknowledging durable writes
+- fast leader failover without split brain
+- memory-efficient storage and predictable tail latency
+- snapshots, recovery, rebalancing, and online membership changes
+- benchmark-driven optimization of networking, batching, allocation, and CPU locality
 
-ProtoBuf service definition is at `api/proto/homekv_service.proto`
+"Fastest" is treated as a measurable engineering goal, not a claim: every optimization must be backed by reproducible benchmarks with consistency and durability settings stated explicitly.
 
-### API
-HomeKV provides a RPC service through GRPC, which includes the following APIs,
-* `get`: get values for multiple keys
-* `set`: set multiple key-value pairs **transactionally**
-* `del`: del values for multiple keys **transactionally**
-* `metrics`: show storage metrics, number of keys, size of total values, and number of commands
+## Architecture direction
 
-### Build
+The v1 architecture is based on **shared-nothing shard workers + per-shard consensus**:
 
-```bash
-# homekv/
-.
-├── Cargo.lock
-├── Cargo.toml
-├── README.md
-├── api
-│   └── proto
-│       └── homekv_service.proto
-├── build.rs
-└── src
-    ├── bin
-    │   ├── hkvctl.rs
-    │   └── homekv.rs
-    ├── common
-    │   ├── error.rs
-    │   └── mod.rs
-    ├── lib.rs
-    └── storage
-        ├── btree_store.rs
-        ├── mod.rs
-        └── mvcc.rs
+```text
+client
+  |
+  | shard-map-aware routing
+  v
++---------------- HomeKV node ----------------+
+|                                             |
+|  shard worker 0   shard worker 1   ...      |
+|  +------------+   +------------+            |
+|  | state      |   | state      |            |
+|  | machine    |   | machine    |            |
+|  | raft group |   | raft group |            |
+|  +------------+   +------------+            |
+|                                             |
+|  WAL / snapshots / transport / metadata     |
++---------------------------------------------+
 ```
 
-Rust has a versatile build tool, Cargo, which make our building is very
-easy.
+Core decisions:
 
-#### Rust ENV Preparation
-Please follow the Official Rust Installation to use `rustup` tool to
-install Rust and Cargo.
+- **Shard-owned state:** one execution owner per shard; avoid locks on the normal data path.
+- **Stable logical shards:** key placement maps to logical shards, not directly to process liveness.
+- **Consensus-owned leadership and membership:** gossip may provide health signals, but it never authoritatively changes ownership.
+- **Raft-first replication:** writes are ordered through the shard leader and acknowledged according to the configured durability contract.
+- **Strong reads:** leader-local fast path when safe; quorum-backed barrier/ReadIndex fallback when required.
+- **Native data-plane protocol:** a compact pipelined protocol is the long-term hot path; gRPC/Tonic remains useful for control-plane APIs.
+- **Single-shard atomicity first:** arbitrary cross-shard transactions are deliberately out of v1 scope.
 
-#### Cargo Build
-HomeKV provides a command-line client tool called `hkvctl`, and a server
-starter called `homekv`. They are both under the `src/bin` folder, which
-will be built as binary executable files under `target/release` when we
-build this repo.
+See [docs/architecture.md](docs/architecture.md) and [docs/consistency.md](docs/consistency.md).
 
-We just need to run the following command under the root folder of this repo.
+## Rust vs. Zig
+
+HomeKV remains **Rust-first** for v1.
+
+The largest expected performance gains come from architecture: eliminating whole-store copy-on-write, reducing synchronization, batching replication, improving memory layout, and optimizing the network path. Zig is kept as a controlled experiment for hot components after the architecture stabilizes.
+
+A language change must earn its complexity through repeatable improvements in metrics such as p99 latency, cycles/op, throughput/core, memory/key, or recovery time.
+
+See [docs/adr/0001-rust-vs-zig.md](docs/adr/0001-rust-vs-zig.md).
+
+## Roadmap
+
+| Milestone | Goal |
+| --- | --- |
+| M0 | Establish reproducible single-node and distributed baselines |
+| M1 | Replace whole-tree COW MVCC with shard-owned in-memory execution |
+| M2 | Build a low-overhead pipelined data plane |
+| M3 | Add a correct 3-node replicated state machine |
+| M4 | Scale to many logical shards / Multi-Raft |
+| M5 | Add WAL, group commit, snapshots, restart and recovery |
+| M6 | Add linearizability and failure-injection testing |
+| M7 | Optimize CPU locality, memory layout, batching and I/O |
+| M8 | Run controlled Rust-vs-Zig hot-path experiments |
+| M9 | Publish reproducible comparative benchmark results |
+
+Benchmark methodology is defined in [docs/benchmarking.md](docs/benchmarking.md).
+
+## Spec-driven development
+
+HomeKV follows a strict **Requirements → Design → Tasks → Implementation → Verification** workflow.
+
+Significant changes start under [`specs/`](specs/README.md), not directly as implementation PRs. Each spec has stable requirement IDs, explicit invariants/failure semantics, a task decomposition, and a verification matrix. Implementation begins only after the relevant spec reaches **Accepted** status, and a milestone is complete only when the spec reaches **Verified**.
+
+Current specs:
+
+- [`0001-homekv-v1`](specs/0001-homekv-v1/requirements.md) — system-level v1 requirements and architecture
+- [`0002-baseline-benchmark`](specs/0002-baseline-benchmark/requirements.md) — M0 benchmark contract before storage-engine changes
+
+If implementation discovers that an accepted assumption is wrong, the spec is amended and reviewed before the semantic change is merged.
+
+## Current prototype
+
+The existing codebase contains useful experiments that will be evolved rather than treated as the final architecture:
+
+- in-memory `BTreeMap` storage
+- copy-on-write MVCC snapshots
+- Tonic/gRPC service and CLI
+- gossip-based discovery
+- phi-accrual failure detection
+- consistent hashing
+
+The current COW MVCC design clones the underlying store on the first mutation of a write transaction. That gives clean snapshot semantics but makes write amplification grow with the dataset, so replacing that path is the first major storage-engine milestone.
+
+## Build
 
 ```bash
-# switch pwd to homekv
 cargo build --release
 ```
 
-### Run
-#### Start homekv server
+Run the server:
+
 ```bash
-# switch pwd to homekv
 ./target/release/homekv -h 127.0.0.1 -p 20001
 ```
 
-#### Play with the cli
+Use the CLI:
+
 ```bash
-# switch pwd to homekv
-
-# Set key/keys by specifying `cmd` as `set` and `kvs` as 1/n key-value pairs
-./target/release/hkvctl -h 127.0.0.1 -p 20001  --cmd set --kvs dummy_key=🦫
-./target/release/hkvctl -h 127.0.0.1 -p 20001  --cmd set --kvs trail=big_cedder people=5 start_time=12:00
-
-# Get key/keys by specifying `cmd` as `get` and `keys` as 1/n keys
-./target/release/hkvctl -h 127.0.0.1 -p 20001  --cmd get --keys dummy_key
-./target/release/hkvctl -h 127.0.0.1 -p 20001  --cmd get --keys trail people
-# Not existing keys
-./target/release/hkvctl -h 127.0.0.1 -p 20001  --cmd get --keys end_time
-
-# Delete key/keys by specifying `cmd` as `del` and `keys` as 1/n keys
-./target/release/hkvctl -h 127.0.0.1 -p 20001  --cmd del --keys dummy_key
-./target/release/hkvctl -h 127.0.0.1 -p 20001  --cmd del --keys people start_time
-# Not existing keys
-./target/release/hkvctl -h 127.0.0.1 -p 20001  --cmd del --keys end_time
-
-# Observability
-./target/release/hkvctl -h 127.0.0.1 -p 20001  --cmd metrics
+./target/release/hkvctl -h 127.0.0.1 -p 20001 --cmd set --kvs hello=world
+./target/release/hkvctl -h 127.0.0.1 -p 20001 --cmd get --keys hello
+./target/release/hkvctl -h 127.0.0.1 -p 20001 --cmd metrics
 ```
+
+## Engineering principles
+
+1. **Specs before semantics.** Significant behavioral or architectural changes are accepted in `specs/` before implementation.
+2. **Correctness before benchmark wins.** No performance result is meaningful if the compared semantics differ silently.
+3. **Tail latency matters.** p99/p99.9, CPU saturation behavior, and recovery spikes are first-class metrics.
+4. **Failure behavior is part of the API.** Partitions, stale leaders, retries, and reconfiguration must have explicit semantics.
+5. **Measure before rewriting.** Architecture and language choices are benchmarked against baselines.
+6. **Keep the hot path small.** Data-plane dependencies and allocations should be justified by profiling.
+
+## License
+
+See [LICENSE](LICENSE).
