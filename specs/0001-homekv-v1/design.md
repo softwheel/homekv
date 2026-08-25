@@ -1,6 +1,6 @@
 # Spec 0001 — HomeKV v1 Design
 
-- Status: Draft
+- Status: Accepted
 - Requirements: `requirements.md`
 - Tracking issue: #7
 
@@ -15,9 +15,9 @@ client
   v
 node ingress
   |
-  +--> shard router --> shard worker --> consensus group --> WAL
-                           |                |
-                           |                +--> followers
+  +--> shard router --> shard worker --> raft-rs group --> WAL
+                           |                 |
+                           |                 +--> followers
                            v
                      in-memory state
 ```
@@ -26,164 +26,136 @@ The design optimizes the healthy path without weakening the consistency contract
 
 ## 2. Requirement mapping
 
-- `REQ-SHARD-*` -> stable logical shard IDs + versioned placement metadata
-- `REQ-CONS-*` -> leader-authoritative replicated state machine + safe linearizable read path
-- `REQ-DUR-*` -> replicated WAL + snapshots + deterministic replay
+- `REQ-SHARD-*` -> fixed logical shard space + versioned placement metadata
+- `REQ-CONS-*` -> leader-authoritative replicated state machine + safe ReadIndex path
+- `REQ-DUR-*` -> quorum-persisted Raft WAL + snapshots + deterministic replay
 - `REQ-FAIL-*` -> consensus-controlled leadership/membership; gossip remains advisory
 - `REQ-PERF-*` -> shard-owned execution, no whole-store COW, batching, compact data plane
 - `REQ-OPS-*` -> per-shard consensus/data-plane metrics and topology inspection
+- `REQ-RAFT-*` -> TiKV `raft-rs` consensus core with HomeKV-owned integration
 
 ## 3. Logical shards
 
-Keys map to stable logical shard IDs using a deterministic hash function over key bytes and a configured shard space.
+The v1 shard space contains **1,024 logical shards**. Keys map with:
 
-The logical shard ID is independent of current node membership. A separate versioned placement map assigns each shard to a replication group and identifies current replicas/leader hints.
+```text
+shard_id = XXH3_64(key_bytes) & 1023
+```
 
-This satisfies `REQ-SHARD-001` and prevents failure detector disagreement from redefining ownership (`REQ-SHARD-002`).
+The count is fixed at cluster bootstrap in v1. Changing the hash or shard count is a compatibility/migration event and requires a new accepted spec.
 
-### Initial choice
-
-For v1, prefer a fixed power-of-two shard space so shard selection can be implemented with a stable hash + mask/modulo operation. The exact initial count remains an acceptance-time parameter rather than a semantic guarantee.
+Logical shard ID is independent of current node membership. A separate versioned placement map assigns each shard to a replication group and identifies replicas plus leader hints.
 
 ## 4. Execution ownership
 
-A shard has one execution owner on a node. Workers own multiple shards, but a single shard's state-machine mutations execute serially on one worker.
+A shard has one execution owner on a node. A worker may own multiple shards, but each shard's state-machine mutations execute serially on one worker.
 
-Benefits:
+Cross-worker communication uses bounded queues. Queue depth is observable and overload is rejected/backpressured before unbounded memory growth.
 
-- no global data lock across independent shards
-- deterministic apply order
-- reduced synchronization on point operations
-- natural backpressure point per worker/shard
-
-Cross-worker communication uses bounded queues. Queue depth is observable and overload is rejected/backpressured before unbounded memory growth (`REQ-OPS-003`).
+M1 owns the exact worker/shard scheduling and queue design. It must remain local/single-node; consensus integration begins in M3.
 
 ## 5. In-memory storage
 
-The primary v1 engine is point-operation oriented.
-
-Direction:
+The primary v1 engine is point-operation oriented:
 
 - hash-indexed keys
-- owned byte strings for keys/values initially
+- owned byte strings initially
 - no whole-store clone on mutation
 - explicit memory accounting
-- allocator/arena experiments only after baseline profiling
+- allocator/arena specialization only after profiling
 
-The existing BTree/COW implementation remains a benchmark/control implementation until M1 is verified.
+The existing BTree/COW implementation remains the immutable M0 benchmark/control implementation until M1 is verified.
 
-MVCC is not a required primitive for the default single-key/single-shard v1 contract. If future snapshot/read semantics need multiple visible versions, they should be added by a dedicated spec rather than retained implicitly.
+MVCC is not required for the default v1 contract. Future multi-version semantics require a dedicated spec.
 
-## 6. Replicated state machine
+## 6. Consensus core
 
-Each logical shard is backed by a consensus group, initially three replicas in distributed benchmarks.
+Production v1 uses **TiKV `raft-rs`** as the Raft algorithm core. HomeKV intentionally owns the surrounding database machinery:
 
-### Mutation path
+- persistent Raft log/WAL
+- transport
+- state machine
+- scheduling and batching
+- snapshots/recovery
+- metrics
+- logical-shard placement and routing
 
-1. client routes to leader or any node that can redirect;
-2. leader validates current authority/epoch;
-3. command is proposed into the shard log;
-4. entry is replicated;
-5. quorum/durability condition is satisfied;
-6. entry becomes committed;
-7. state machine applies it in log order;
-8. response is returned according to the configured acknowledgement contract.
+The exact pinned crate/git revision and adapter APIs belong to Spec M3, so the dependency can be pinned reproducibly at implementation time.
 
-The command representation contains enough information for deterministic application.
+Why `raft-rs`:
 
-### Consensus implementation choice
+- it is a low-level consensus core rather than a complete database framework;
+- it is used by TiKV and is suitable for many independent Raft groups;
+- HomeKV retains control over the hot replication, persistence and scheduling paths;
+- it avoids making bespoke consensus correctness a prerequisite for the database project.
 
-The first production-quality v1 path should strongly prefer an existing, battle-tested Rust Raft implementation unless a separate accepted spec justifies implementing Raft itself. HomeKV's differentiating work is the data plane, memory engine, replication integration, and performance behavior—not proving that a bespoke consensus implementation can reach parity.
+A from-scratch Raft may exist as a research subproject but is not the v1 correctness foundation.
 
-A from-scratch Raft implementation may exist as an educational/research subproject, but must not silently become the correctness foundation without equivalent verification.
+## 7. Mutation path
 
-## 7. Read path
+For a replicated shard:
+
+1. client routes to the leader or receives a structured redirect;
+2. leader validates current authority/placement epoch;
+3. deterministic command is proposed to the `raft-rs` group;
+4. replicas persist the Raft Ready state before acknowledging replication success;
+5. quorum persistence allows the entry to become committed;
+6. leader applies the committed entry to its shard state machine;
+7. leader returns success.
+
+The initial durable path favors correctness and measurable semantics over minimum fsync latency. Group commit/batching optimizations are added only after this baseline path is verified.
+
+## 8. Read path
 
 Default GET is linearizable.
 
-Read hierarchy:
+M3 starts with **safe quorum-backed ReadIndex/equivalent behavior**. A read is served only after the leader establishes the required read barrier and its local state machine has applied through that barrier.
 
-1. leader-local fast path only when leadership safety can be established under the chosen consensus/lease mechanism;
-2. otherwise ReadIndex/equivalent quorum-backed barrier;
-3. stale follower reads, if ever added, require a separate explicit consistency mode/spec.
+Lease-based leader-local reads are explicitly deferred. They may be introduced by a later performance spec only after assumptions about leadership, clocks/timing, pause behavior and failure tests are explicit.
 
-The initial implementation may use the safer barrier path first and add leader-lease optimization later behind benchmark + correctness evidence.
+Follower reads are not part of the default v1 consistency API.
 
-## 8. Durability model
+## 9. Linux durability boundary
 
-HomeKV is memory-first but supports durable acknowledged writes.
+The v1 durable acknowledgement contract is:
 
-Initial persistence design:
+> A successful distributed mutation response requires quorum-persisted Raft state and local leader application of the committed entry.
 
-- append-only segmented WAL
-- checksummed records/frames
-- group commit capability
-- consensus log metadata sufficient for replay
-- snapshots with last-included log index/term and integrity metadata
-- replay committed entries after restart
+For the first Linux implementation, a replica counts an entry as persisted only after required log bytes and Raft hard-state metadata reach the configured durable WAL boundary and the corresponding durability operation (`fdatasync`, `fsync`, or verified equivalent) completes successfully.
 
-### Proposed default acknowledgement contract
+The `raft-rs` Ready processing order must preserve its persistence-before-message safety requirements. WAL records are checksummed. Snapshots include last-included index/term plus integrity metadata.
 
-For the v1 durable mode, a write response should require the entry to be committed by a quorum whose acknowledgement includes persistence to the configured durable WAL boundary.
+A future relaxed/memory-only mode must be explicitly named and cannot be compared as equivalent to the default durable mode.
 
-A future explicitly named memory-only/relaxed durability mode may trade durability for lower latency, but benchmark output must label it separately. The default strong benchmark should use the durable contract.
+## 10. Membership and gossip
 
-This resolves the intended direction for `REQ-DUR-001/002`, subject to spec review.
+The existing gossip/phi detector becomes a health-observation subsystem. It may discover nodes, surface suspicion, emit metrics, or trigger a reconfiguration proposal.
 
-## 9. Membership, gossip, and reconfiguration
+It may not elect a leader, promote a replica, mutate authoritative membership, or allow writes from local suspicion alone.
 
-The existing gossip/phi detector becomes a health-observation subsystem.
+Replica membership changes use Raft-safe configuration transitions. Placement metadata carries a monotonically increasing epoch/version.
 
-It can:
+## 11. Client routing and retries
 
-- discover nodes
-- surface suspicion
-- emit metrics
-- trigger a proposal to move/replace a replica
+Clients may cache shard-map version, shard -> replication group mapping and leader hints.
 
-It cannot:
+A stale/non-leader node returns a structured retry/redirect result containing the best-known placement epoch and leader hint.
 
-- directly elect a shard leader
-- directly promote a replica
-- change authoritative membership
-- allow writes based on local suspicion
+The v1 mutation surface is deliberately idempotent: unconditional PUT, DELETE and deterministic batches can be retried after an uncertain transport/routing result. Request IDs are correlation metadata, not a general exactly-once guarantee.
 
-Replica movement uses consensus-aware membership transitions. Placement metadata receives a monotonically increasing epoch/version.
+Non-idempotent commands require a later spec with replicated deduplication semantics.
 
-## 10. Client routing
+## 12. Data-plane protocol
 
-Clients may cache:
+Tonic/gRPC remains useful for administrative/control APIs.
 
-- shard-map version
-- shard -> replication group
-- leader hint
+The hot data plane evolves in M2 toward a compact framed protocol with request ID, command, routing epoch, lengths, pipelining/multiplexing, batch representation, explicit redirect/status responses and bounded frame size.
 
-If a request reaches a stale/non-leader node, that node returns a structured redirect/retry response including the best-known newer epoch/leader information.
+M2 owns the exact wire format and compatibility rules.
 
-The protocol must distinguish retriable routing errors from application results.
+## 13. Snapshots and recovery
 
-Mutation request IDs are recommended before adding non-idempotent operations beyond PUT/DELETE; v1 PUT/DELETE retries can be made idempotent at the command semantics level.
-
-## 11. Data-plane protocol
-
-Tonic/gRPC remains available for administrative/control APIs.
-
-The hot data plane evolves toward a compact framed binary protocol with:
-
-- request ID
-- command type
-- shard-map epoch or optional routing metadata
-- key/value lengths
-- pipelining/multiplexing
-- batch representation
-- explicit status/redirect responses
-- bounded frame size
-
-M2 will define the wire format in its own child spec before implementation.
-
-## 12. Snapshots and recovery
-
-Snapshot creation should avoid long global pauses. The exact implementation is deferred to the persistence child spec, but the state machine must support a consistent snapshot boundary at a committed/applied log position.
+Snapshot creation must avoid long global pauses and be anchored at a committed/applied log position.
 
 Recovery sequence:
 
@@ -193,9 +165,11 @@ Recovery sequence:
 4. participate in consensus only after state is coherent;
 5. never expose speculative/uncommitted entries as applied state.
 
-## 13. Rebalancing
+Exact snapshot/WAL segmentation details are specified in the persistence work under M3/M5.
 
-Safe shard movement:
+## 14. Rebalancing
+
+Safe shard movement under M4:
 
 1. choose target replica placement;
 2. add learner/non-voting replica where supported;
@@ -203,32 +177,51 @@ Safe shard movement:
 4. commit membership change;
 5. optionally transfer leadership;
 6. remove old replica;
-7. publish placement epoch.
+7. publish the newer placement epoch.
 
-Foreground performance impact is part of verification.
+Foreground latency impact is part of verification.
 
-## 14. Observability
+## 15. Observability
 
-Per node/shard metrics should eventually include:
+Per node/shard metrics should include requests/latency by operation, queue depth/backpressure, leader/role, term/epoch, commit/applied index, replication lag, batching, WAL sync latency, snapshot bytes/time, memory/key/value bytes, elections/leadership changes and gossip suspicion state.
 
-- requests + latency by operation
-- queue depth/backpressure events
-- shard leader/role
-- term/epoch
-- commit index/applied index
-- replication lag
-- proposal batching
-- WAL append/fsync/group-commit latency
-- snapshot bytes/time
-- memory used / key count / value bytes
-- elections / leadership changes
-- gossip suspicion state
+## 16. Milestone boundaries
 
-## 15. Alternatives considered
+### M0 — Baseline
+
+Benchmark only. No storage optimization.
+
+### M1 — Local shard-owned engine
+
+Owns storage layout, shard/worker ownership, local queues/backpressure, memory accounting and single-shard atomic application. No Raft.
+
+### M2 — Data plane
+
+Owns framed wire protocol, pipelining, client/server routing metadata and redirect/error semantics. It can run against local shards without Multi-Raft.
+
+### M3 — One replicated shard
+
+Owns `raft-rs` adapter, three-replica transport, WAL persistence, safe ReadIndex, failover, snapshots sufficient for one group and recovery verification.
+
+### M4 — Multi-Raft / placement
+
+Owns 1,024 logical shard placement, many Raft-group scheduling, rebalancing, placement epochs, shard-aware client routing and multi-group operational behavior.
+
+### M5+
+
+Owns persistence/operability hardening and performance optimization after the basic distributed architecture is proven.
+
+## 17. Benchmark authority
+
+M0/M1 results are valid engineering evidence on any host whose metadata is recorded. CI results are regression signals, not release claims.
+
+The exact dedicated hardware/network profile for public comparative claims is deliberately selected and frozen by the release/comparison benchmark spec. This deferred machine selection does not weaken the correctness or architecture acceptance gates.
+
+## 18. Alternatives considered
 
 ### Direct consistent-hash ownership
 
-Rejected for authoritative placement because local membership views can disagree during partitions and violate strong consistency.
+Rejected for authoritative placement because local membership views can disagree during partitions.
 
 ### Global shared concurrent map
 
@@ -236,22 +229,26 @@ Rejected as the primary architecture because it couples independent shards throu
 
 ### Keep copy-on-write MVCC
 
-Rejected for the main write path because first mutation can clone the entire underlying store, violating `REQ-PERF-004`.
+Rejected for the main write path because first mutation can clone the entire underlying store.
 
 ### Rewrite everything in Zig first
 
 Rejected by ADR 0001. Architecture is the higher-leverage bottleneck; Zig remains a measured hot-path option.
 
+### OpenRaft
+
+A credible alternative with higher-level application APIs and documented leader-lease support. HomeKV selects `raft-rs` because v1 intentionally wants lower-level control of WAL, transport, scheduling and eventual Multi-Raft behavior. The initial implementation still uses safe ReadIndex rather than chasing a lease fast path.
+
 ### Build custom Raft first
 
-Not preferred for the production v1 path. Correctness risk and verification cost are high relative to HomeKV's primary goals.
+Rejected for production v1 because correctness risk and verification cost are high relative to HomeKV's primary goals.
 
-## 16. Open design items before Accepted
+## 19. Accepted decisions
 
-1. Select the Rust consensus library and document its read/lease semantics.
-2. Fix the initial logical shard count and hash algorithm for v1 compatibility.
-3. Define exact WAL persistence acknowledgement semantics on Linux.
-4. Define the child-spec boundary for M1 memory engine vs M2 protocol vs M3 replication.
-5. Establish authoritative benchmark hardware/profile for release claims.
+All acceptance-blocking design items are resolved or deliberately delegated to child specs:
 
-Implementation tasks remain blocked until these are resolved or explicitly deferred in an accepted revision.
+1. consensus core: TiKV `raft-rs`;
+2. shard space: 1,024 shards, XXH3-64 low 10 bits;
+3. durability: quorum durable WAL persistence + leader apply before success;
+4. M1/M2/M3/M4 boundaries: fixed in section 16;
+5. benchmark authority: host metadata for development; dedicated release machine frozen later.
