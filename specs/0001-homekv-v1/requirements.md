@@ -1,6 +1,6 @@
 # Spec 0001 — HomeKV v1 Requirements
 
-- Status: Accepted
+- Status: Accepted (amended for OpenRaft selection)
 - Tracking issue: #7
 
 ## 1. Purpose
@@ -60,7 +60,7 @@ HomeKV v1 supports:
 
 **REQ-CONS-005** — During a network partition, a minority replica set MUST NOT independently become writable outside the consensus protocol.
 
-**REQ-CONS-006** — The first replicated v1 implementation MUST use a quorum-backed safe read barrier (ReadIndex or equivalent). Lease-based reads are deferred until a later accepted optimization spec verifies clock/leadership assumptions.
+**REQ-CONS-006** — The first replicated v1 implementation MUST use a quorum-backed safe read barrier (`read_index`, `get_read_log_id`, or equivalent). Lease-based reads are deferred until a later accepted optimization spec verifies leadership/timing assumptions.
 
 ## 5. Durability requirements
 
@@ -132,9 +132,13 @@ These are engineering targets rather than release claims until verified on contr
 
 ## 12. Consensus dependency
 
-**REQ-RAFT-001** — The production v1 consensus core MUST use TiKV `raft-rs` rather than a bespoke Raft implementation. The exact pinned revision/version and integration contract are owned by the M3 child spec.
+**REQ-RAFT-001** — The production v1 M3 consensus integration MUST use OpenRaft rather than a bespoke Raft implementation. The exact pinned OpenRaft version and integration contract are owned by the M3 child spec.
 
-**REQ-RAFT-002** — HomeKV owns the WAL, transport, state machine, scheduling, batching, observability and placement integration around the Raft core.
+**REQ-RAFT-002** — HomeKV MUST retain ownership of its database-specific Raft storage implementation, state machine, network transport/connection management, durability boundary, observability, scheduling, and placement integration through OpenRaft's extension interfaces.
+
+**REQ-RAFT-003** — M4 MUST benchmark and verify the many-group cost of the chosen OpenRaft integration, including per-group task/runtime overhead, connection sharing, memory/group, throughput/core, and tail latency. `openraft-multi` MAY be used, but its alpha/pre-1.0 status MUST NOT bypass this verification gate.
+
+**REQ-RAFT-004** — If the M4 scaling gate demonstrates that OpenRaft cannot meet HomeKV's accepted performance requirements after reasonable integration optimization, a new accepted consensus-adapter amendment MAY replace the crate without changing the externally visible consistency/durability requirements.
 
 ## 13. Milestone boundaries
 
@@ -144,9 +148,9 @@ These are engineering targets rather than release claims until verified on contr
 
 **REQ-SDD-003** — M2 defines/implements the low-overhead data-plane protocol and routing semantics without making Multi-Raft a dependency.
 
-**REQ-SDD-004** — M3 proves one 3-replica shard with Raft, WAL durability, safe linearizable reads, failover and recovery.
+**REQ-SDD-004** — M3 proves one 3-replica shard with OpenRaft, WAL durability, safe linearizable reads, failover and recovery.
 
-**REQ-SDD-005** — M4 scales the proven M3 machinery to the 1,024-shard placement/Multi-Raft architecture.
+**REQ-SDD-005** — M4 scales the proven M3 machinery to the 1,024-shard placement/Multi-Raft architecture and verifies OpenRaft's many-group cost.
 
 ## 14. Non-goals
 
@@ -164,10 +168,10 @@ HomeKV v1 does not require:
 
 ## 15. Acceptance decisions
 
-The acceptance-time questions are resolved as follows:
+The acceptance-time decisions are:
 
 1. **Logical shard space:** 1,024 shards; `XXH3_64(key) & 1023`; fixed at cluster bootstrap in v1.
-2. **Durable acknowledgement:** quorum-persisted Raft state plus local leader apply before response.
-3. **Consensus core:** TiKV `raft-rs`; exact pinned revision and integration details belong to M3.
+2. **Durable acknowledgement:** quorum-durable Raft persistence plus local leader apply before response.
+3. **Consensus integration:** OpenRaft for M3; exact pin/integration details belong to M3. M4 includes a mandatory many-group scaling gate and may trigger a later adapter amendment if evidence requires it.
 4. **Benchmark authority:** M0 records actual host metadata; release-claim hardware is selected and frozen by the release/comparison spec.
 5. **Retries:** unconditional PUT/DELETE/deterministic batches are idempotent and retriable; general exactly-once semantics are out of v1 scope.
