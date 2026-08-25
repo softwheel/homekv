@@ -80,6 +80,19 @@ See [docs/adr/0001-rust-vs-zig.md](docs/adr/0001-rust-vs-zig.md).
 
 Benchmark methodology is defined in [docs/benchmarking.md](docs/benchmarking.md).
 
+## Spec-driven development
+
+HomeKV follows a strict **Requirements → Design → Tasks → Implementation → Verification** workflow.
+
+Significant changes start under [`specs/`](specs/README.md), not directly as implementation PRs. Each spec has stable requirement IDs, explicit invariants/failure semantics, a task decomposition, and a verification matrix. Implementation begins only after the relevant spec reaches **Accepted** status, and a milestone is complete only when the spec reaches **Verified**.
+
+Current specs:
+
+- [`0001-homekv-v1`](specs/0001-homekv-v1/requirements.md) — system-level v1 requirements and architecture
+- [`0002-baseline-benchmark`](specs/0002-baseline-benchmark/requirements.md) — M0 benchmark contract before storage-engine changes
+
+If implementation discovers that an accepted assumption is wrong, the spec is amended and reviewed before the semantic change is merged.
+
 ## Current prototype
 
 The existing codebase contains useful experiments that will be evolved rather than treated as the final architecture:
@@ -115,11 +128,12 @@ Use the CLI:
 
 ## Engineering principles
 
-1. **Correctness before benchmark wins.** No performance result is meaningful if the compared semantics differ silently.
-2. **Tail latency matters.** p99/p99.9, CPU saturation behavior, and recovery spikes are first-class metrics.
-3. **Failure behavior is part of the API.** Partitions, stale leaders, retries, and reconfiguration must have explicit semantics.
-4. **Measure before rewriting.** Architecture and language choices are benchmarked against baselines.
-5. **Keep the hot path small.** Data-plane dependencies and allocations should be justified by profiling.
+1. **Specs before semantics.** Significant behavioral or architectural changes are accepted in `specs/` before implementation.
+2. **Correctness before benchmark wins.** No performance result is meaningful if the compared semantics differ silently.
+3. **Tail latency matters.** p99/p99.9, CPU saturation behavior, and recovery spikes are first-class metrics.
+4. **Failure behavior is part of the API.** Partitions, stale leaders, retries, and reconfiguration must have explicit semantics.
+5. **Measure before rewriting.** Architecture and language choices are benchmarked against baselines.
+6. **Keep the hot path small.** Data-plane dependencies and allocations should be justified by profiling.
 
 ## License
 
