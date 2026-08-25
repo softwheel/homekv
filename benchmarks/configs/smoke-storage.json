@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "mode": "smoke",
+  "seed": 42,
+  "profiles": [
+    { "key_size": 16, "value_size": 64 }
+  ],
+  "dataset_cardinalities": [100, 500],
+  "workloads": ["get", "set", "delete", "read80_write20"],
+  "warmup_operations": 5,
+  "storage_operations": 20
+}

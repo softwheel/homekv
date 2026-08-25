@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "mode": "baseline",
+  "seed": 42,
+  "profiles": [
+    { "key_size": 16, "value_size": 64 }
+  ],
+  "dataset_cardinalities": [1000, 10000, 50000],
+  "workloads": ["get", "set", "delete", "read80_write20"],
+  "warmup_operations": 20,
+  "storage_operations": 200
+}
