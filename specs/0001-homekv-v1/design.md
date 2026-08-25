@@ -1,6 +1,6 @@
 # Spec 0001 — HomeKV v1 Design
 
-- Status: Accepted
+- Status: Accepted (amended for OpenRaft selection)
 - Requirements: `requirements.md`
 - Tracking issue: #7
 
@@ -15,9 +15,9 @@ client
   v
 node ingress
   |
-  +--> shard router --> shard worker --> raft-rs group --> WAL
-                           |                 |
-                           |                 +--> followers
+  +--> shard router --> shard worker --> OpenRaft group --> WAL
+                           |               |
+                           |               +--> followers
                            v
                      in-memory state
 ```
@@ -27,12 +27,12 @@ The design optimizes the healthy path without weakening the consistency contract
 ## 2. Requirement mapping
 
 - `REQ-SHARD-*` -> fixed logical shard space + versioned placement metadata
-- `REQ-CONS-*` -> leader-authoritative replicated state machine + safe ReadIndex path
-- `REQ-DUR-*` -> quorum-persisted Raft WAL + snapshots + deterministic replay
+- `REQ-CONS-*` -> leader-authoritative replicated state machine + safe OpenRaft read barrier
+- `REQ-DUR-*` -> quorum-durable Raft log storage + snapshots + deterministic replay
 - `REQ-FAIL-*` -> consensus-controlled leadership/membership; gossip remains advisory
 - `REQ-PERF-*` -> shard-owned execution, no whole-store COW, batching, compact data plane
 - `REQ-OPS-*` -> per-shard consensus/data-plane metrics and topology inspection
-- `REQ-RAFT-*` -> TiKV `raft-rs` consensus core with HomeKV-owned integration
+- `REQ-RAFT-*` -> OpenRaft M3 integration with a mandatory M4 many-group scaling gate
 
 ## 3. Logical shards
 
@@ -68,28 +68,33 @@ The existing BTree/COW implementation remains the immutable M0 benchmark/control
 
 MVCC is not required for the default v1 contract. Future multi-version semantics require a dedicated spec.
 
-## 6. Consensus core
+## 6. Consensus integration
 
-Production v1 uses **TiKV `raft-rs`** as the Raft algorithm core. HomeKV intentionally owns the surrounding database machinery:
+Production v1 M3 uses **OpenRaft** as the Raft implementation.
 
-- persistent Raft log/WAL
-- transport
-- state machine
-- scheduling and batching
-- snapshots/recovery
-- metrics
-- logical-shard placement and routing
+HomeKV still owns the database-specific surrounding machinery through OpenRaft's application interfaces:
 
-The exact pinned crate/git revision and adapter APIs belong to Spec M3, so the dependency can be pinned reproducibly at implementation time.
+- `RaftLogStorage` implementation backed by HomeKV's durable WAL/log format
+- `RaftStateMachine` implementation backed by the shard-owned in-memory engine
+- `RaftNetwork`/network-factory integration using HomeKV's connection management and transport
+- snapshot encoding/storage/installation
+- request routing and redirect semantics
+- metrics and topology reporting
+- shard placement and Multi-Raft scheduling policy
 
-Why `raft-rs`:
+The exact pinned OpenRaft version, feature flags, storage adapter and network adapter belong to Spec M3 so the dependency can be frozen reproducibly at implementation time.
 
-- it is a low-level consensus core rather than a complete database framework;
-- it is used by TiKV and is suitable for many independent Raft groups;
-- HomeKV retains control over the hot replication, persistence and scheduling paths;
-- it avoids making bespoke consensus correctness a prerequisite for the database project.
+### Why OpenRaft for M3
 
-A from-scratch Raft may exist as a research subproject but is not the v1 correctness foundation.
+OpenRaft better matches HomeKV's v1 development objective than using the lower-level `raft-rs::RawNode` API directly:
+
+- storage, state-machine and network responsibilities are explicit application interfaces;
+- linearizable read APIs are documented as part of the framework;
+- membership changes, learner handling and snapshots are integrated rather than reconstructed around a raw consensus core;
+- it is async/event-driven and can batch internal work without requiring HomeKV to hand-roll the full Ready/persist/send/apply orchestration correctly;
+- it lets v1 spend engineering effort on database data-path behavior instead of consensus plumbing while retaining ownership of HomeKV-specific WAL/network/state-machine code.
+
+This is an integration choice, not a permanent performance assumption. Section 16 defines the M4 scaling gate.
 
 ## 7. Mutation path
 
@@ -97,21 +102,23 @@ For a replicated shard:
 
 1. client routes to the leader or receives a structured redirect;
 2. leader validates current authority/placement epoch;
-3. deterministic command is proposed to the `raft-rs` group;
-4. replicas persist the Raft Ready state before acknowledging replication success;
-5. quorum persistence allows the entry to become committed;
-6. leader applies the committed entry to its shard state machine;
-7. leader returns success.
+3. deterministic command is submitted through the OpenRaft client-write path;
+4. HomeKV's OpenRaft log store persists required Raft log/vote/committed state according to the accepted durability boundary;
+5. Raft establishes commitment through the configured quorum;
+6. OpenRaft invokes HomeKV's state machine to apply the committed entry;
+7. HomeKV returns success only after the accepted durable/apply boundary is satisfied.
 
-The initial durable path favors correctness and measurable semantics over minimum fsync latency. Group commit/batching optimizations are added only after this baseline path is verified.
+The M3 spec must explicitly verify that the chosen storage callback/flush semantics satisfy `REQ-DUR-005`; framework-level completion alone is not assumed to imply HomeKV's durable success contract.
+
+Group commit/batching optimizations are added only after the baseline durable path is verified.
 
 ## 8. Read path
 
 Default GET is linearizable.
 
-M3 starts with **safe quorum-backed ReadIndex/equivalent behavior**. A read is served only after the leader establishes the required read barrier and its local state machine has applied through that barrier.
+M3 starts with OpenRaft's safe linearizable read path using `read_index`, `get_read_log_id`, or the version-appropriate equivalent. A read is served only after the leader establishes the required read barrier and its local state machine has applied through that barrier.
 
-Lease-based leader-local reads are explicitly deferred. They may be introduced by a later performance spec only after assumptions about leadership, clocks/timing, pause behavior and failure tests are explicit.
+Lease-based leader-local reads are explicitly deferred. OpenRaft has leader-lease machinery, but HomeKV will not enable a lease fast path until a later performance spec defines and verifies its timing/leadership/pause assumptions.
 
 Follower reads are not part of the default v1 consistency API.
 
@@ -119,11 +126,11 @@ Follower reads are not part of the default v1 consistency API.
 
 The v1 durable acknowledgement contract is:
 
-> A successful distributed mutation response requires quorum-persisted Raft state and local leader application of the committed entry.
+> A successful distributed mutation response requires quorum-durable Raft persistence and local leader application of the committed entry.
 
-For the first Linux implementation, a replica counts an entry as persisted only after required log bytes and Raft hard-state metadata reach the configured durable WAL boundary and the corresponding durability operation (`fdatasync`, `fsync`, or verified equivalent) completes successfully.
+For the first Linux implementation, a replica counts an entry as durable only after required log bytes and Raft persistent metadata reach the configured durable WAL boundary and the corresponding durability operation (`fdatasync`, `fsync`, or verified equivalent) completes successfully.
 
-The `raft-rs` Ready processing order must preserve its persistence-before-message safety requirements. WAL records are checksummed. Snapshots include last-included index/term plus integrity metadata.
+The M3 OpenRaft storage adapter must map OpenRaft's log/vote/commit persistence callbacks to this boundary explicitly. WAL records are checksummed. Snapshots include last-included log identity plus integrity metadata.
 
 A future relaxed/memory-only mode must be explicitly named and cannot be compared as equivalent to the default durable mode.
 
@@ -133,7 +140,7 @@ The existing gossip/phi detector becomes a health-observation subsystem. It may 
 
 It may not elect a leader, promote a replica, mutate authoritative membership, or allow writes from local suspicion alone.
 
-Replica membership changes use Raft-safe configuration transitions. Placement metadata carries a monotonically increasing epoch/version.
+Replica membership changes use OpenRaft's Raft-safe membership transition APIs. Placement metadata carries a monotonically increasing epoch/version.
 
 ## 11. Client routing and retries
 
@@ -161,9 +168,10 @@ Recovery sequence:
 
 1. validate/load latest complete snapshot;
 2. restore shard state and included log metadata;
-3. replay valid subsequent WAL/log entries;
-4. participate in consensus only after state is coherent;
-5. never expose speculative/uncommitted entries as applied state.
+3. restore OpenRaft persistent state/log state;
+4. replay valid subsequent durable entries;
+5. participate in consensus only after state is coherent;
+6. never expose speculative/uncommitted entries as applied state.
 
 Exact snapshot/WAL segmentation details are specified in the persistence work under M3/M5.
 
@@ -172,7 +180,7 @@ Exact snapshot/WAL segmentation details are specified in the persistence work un
 Safe shard movement under M4:
 
 1. choose target replica placement;
-2. add learner/non-voting replica where supported;
+2. add learner/non-voting replica through OpenRaft membership APIs;
 3. transfer snapshot/log until caught up;
 4. commit membership change;
 5. optionally transfer leadership;
@@ -183,9 +191,11 @@ Foreground latency impact is part of verification.
 
 ## 15. Observability
 
-Per node/shard metrics should include requests/latency by operation, queue depth/backpressure, leader/role, term/epoch, commit/applied index, replication lag, batching, WAL sync latency, snapshot bytes/time, memory/key/value bytes, elections/leadership changes and gossip suspicion state.
+Per node/shard metrics should include requests/latency by operation, queue depth/backpressure, leader/role, term/epoch, commit/applied progress, replication lag, batching, WAL sync latency, snapshot bytes/time, memory/key/value bytes, elections/leadership changes and gossip suspicion state.
 
-## 16. Milestone boundaries
+OpenRaft metrics may feed these signals, but HomeKV exposes a database-oriented metrics contract rather than leaking framework-specific types as its public management API.
+
+## 16. Milestone boundaries and OpenRaft scaling gate
 
 ### M0 — Baseline
 
@@ -201,11 +211,25 @@ Owns framed wire protocol, pipelining, client/server routing metadata and redire
 
 ### M3 — One replicated shard
 
-Owns `raft-rs` adapter, three-replica transport, WAL persistence, safe ReadIndex, failover, snapshots sufficient for one group and recovery verification.
+Owns the OpenRaft adapter, three-replica transport, durable log storage, safe linearizable reads, membership basics, failover, snapshots sufficient for one group and recovery verification.
 
 ### M4 — Multi-Raft / placement
 
-Owns 1,024 logical shard placement, many Raft-group scheduling, rebalancing, placement epochs, shard-aware client routing and multi-group operational behavior.
+Owns 1,024 logical shard placement, many-group scheduling, rebalancing, placement epochs, shard-aware client routing and multi-group operational behavior.
+
+M4 MUST benchmark:
+
+- memory per Raft group
+- tasks/futures/timers per group
+- connection count and connection sharing
+- idle-group overhead
+- active groups per core
+- throughput/core and p99/p99.9 as group count grows
+- scheduler/runtime contention
+
+`openraft-multi` is a candidate connection-sharing adapter, not an assumed production dependency. Its current pre-1.0/alpha state requires explicit pinning and verification.
+
+If OpenRaft cannot meet the accepted M4 scaling/performance requirements after reasonable integration optimization, HomeKV may replace the consensus adapter through a new accepted spec amendment while keeping the same consistency/durability semantics.
 
 ### M5+
 
@@ -215,7 +239,7 @@ Owns persistence/operability hardening and performance optimization after the ba
 
 M0/M1 results are valid engineering evidence on any host whose metadata is recorded. CI results are regression signals, not release claims.
 
-The exact dedicated hardware/network profile for public comparative claims is deliberately selected and frozen by the release/comparison benchmark spec. This deferred machine selection does not weaken the correctness or architecture acceptance gates.
+The exact dedicated hardware/network profile for public comparative claims is deliberately selected and frozen by the release/comparison benchmark spec.
 
 ## 18. Alternatives considered
 
@@ -235,9 +259,9 @@ Rejected for the main write path because first mutation can clone the entire und
 
 Rejected by ADR 0001. Architecture is the higher-leverage bottleneck; Zig remains a measured hot-path option.
 
-### OpenRaft
+### TiKV `raft-rs`
 
-A credible alternative with higher-level application APIs and documented leader-lease support. HomeKV selects `raft-rs` because v1 intentionally wants lower-level control of WAL, transport, scheduling and eventual Multi-Raft behavior. The initial implementation still uses safe ReadIndex rather than chasing a lease fast path.
+Still a strong alternative. Its `RawNode`/`Ready` model gives very low-level control and it is proven in TiKV. HomeKV does not select it for M3 because that control also makes HomeKV responsible for more consensus orchestration and persistence/message ordering glue. The M4 scaling gate preserves the option to reconsider the adapter if OpenRaft framework overhead becomes a proven bottleneck.
 
 ### Build custom Raft first
 
@@ -247,8 +271,10 @@ Rejected for production v1 because correctness risk and verification cost are hi
 
 All acceptance-blocking design items are resolved or deliberately delegated to child specs:
 
-1. consensus core: TiKV `raft-rs`;
+1. consensus integration: OpenRaft for M3, with a mandatory M4 many-group scaling gate;
 2. shard space: 1,024 shards, XXH3-64 low 10 bits;
-3. durability: quorum durable WAL persistence + leader apply before success;
+3. durability: quorum-durable Raft persistence + leader apply before success;
 4. M1/M2/M3/M4 boundaries: fixed in section 16;
 5. benchmark authority: host metadata for development; dedicated release machine frozen later.
+
+See `docs/adr/0002-openraft-consensus.md` for the crate-selection rationale and escape criteria.
