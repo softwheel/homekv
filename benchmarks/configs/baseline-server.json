@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "mode": "baseline",
+  "layer": "server",
+  "seed": 42,
+  "workloads": ["get", "set", "delete", "read80_write20"],
+  "warmup_operations": 10,
+  "server": {
+    "endpoint": "http://127.0.0.1:20001",
+    "duration_ms": 5000,
+    "preload_batch_size": 8192,
+    "cases": [
+      { "key_size": 16, "value_size": 64, "dataset_cardinality": 1000, "concurrency": 1 },
+      { "key_size": 16, "value_size": 64, "dataset_cardinality": 1000, "concurrency": 8 },
+      { "key_size": 16, "value_size": 64, "dataset_cardinality": 1000, "concurrency": 32 },
+      { "key_size": 16, "value_size": 64, "dataset_cardinality": 10000, "concurrency": 1 },
+      { "key_size": 16, "value_size": 64, "dataset_cardinality": 10000, "concurrency": 8 },
+      { "key_size": 16, "value_size": 64, "dataset_cardinality": 10000, "concurrency": 32 },
+      { "key_size": 16, "value_size": 64, "dataset_cardinality": 50000, "concurrency": 1 },
+      { "key_size": 16, "value_size": 64, "dataset_cardinality": 50000, "concurrency": 8 },
+      { "key_size": 16, "value_size": 64, "dataset_cardinality": 50000, "concurrency": 32 },
+      { "key_size": 16, "value_size": 256, "dataset_cardinality": 10000, "concurrency": 8 },
+      { "key_size": 32, "value_size": 1024, "dataset_cardinality": 10000, "concurrency": 8 }
+    ]
+  }
+}
