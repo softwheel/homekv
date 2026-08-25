@@ -1,6 +1,6 @@
 # Spec 0001 — HomeKV v1 Requirements
 
-- Status: Draft
+- Status: Accepted
 - Tracking issue: #7
 
 ## 1. Purpose
@@ -44,6 +44,10 @@ HomeKV v1 supports:
 
 **REQ-SHARD-003** — Clients MAY cache shard routing metadata, but stale routing MUST fail safely through redirect/retry behavior rather than accepting writes under stale authority.
 
+**REQ-SHARD-004** — The v1 default shard space MUST contain 1,024 logical shards. The shard count is fixed at cluster creation for v1 and is not changed online.
+
+**REQ-SHARD-005** — v1 key-to-shard mapping MUST use XXH3-64 over raw key bytes and select the low 10 bits of the hash. Any future hash/shard-space change is a compatibility change and requires a new accepted spec.
+
 ## 4. Consistency requirements
 
 **REQ-CONS-001** — The default API MUST provide linearizability per shard.
@@ -56,6 +60,8 @@ HomeKV v1 supports:
 
 **REQ-CONS-005** — During a network partition, a minority replica set MUST NOT independently become writable outside the consensus protocol.
 
+**REQ-CONS-006** — The first replicated v1 implementation MUST use a quorum-backed safe read barrier (ReadIndex or equivalent). Lease-based reads are deferred until a later accepted optimization spec verifies clock/leadership assumptions.
+
 ## 5. Durability requirements
 
 **REQ-DUR-001** — For the durable write mode, an acknowledged mutation MUST survive loss/restart of the current leader subject to the configured replication/durability assumptions.
@@ -66,11 +72,15 @@ HomeKV v1 supports:
 
 **REQ-DUR-004** — WAL and snapshot corruption/integrity failures MUST be detectable rather than silently applied.
 
+**REQ-DUR-005** — The v1 default distributed write mode MUST acknowledge only after the entry is committed by a quorum whose Raft persistence boundary has been durably flushed, and after the leader has applied the committed entry locally.
+
+**REQ-DUR-006** — A relaxed memory-only mode MAY be introduced later, but it MUST be explicitly named and MUST NOT be used for default strong/durable benchmark claims.
+
 ## 6. Failure and reconfiguration requirements
 
 **REQ-FAIL-001** — Gossip/failure detection MAY trigger suspicion or reconfiguration proposals but MUST NOT directly grant authoritative shard leadership or write ownership.
 
-**REQ-FAIL-002** — Leader failure MUST eventually permit a healthy quorum to elect/establish a new authoritative leader.
+**REQ-FAIL-002** — Leader failure MUST eventually permit a healthy quorum to establish a new authoritative leader.
 
 **REQ-FAIL-003** — Requests sent to stale leaders MUST fail or redirect safely.
 
@@ -78,7 +88,15 @@ HomeKV v1 supports:
 
 **REQ-FAIL-005** — A process crash during WAL append, snapshot generation, or snapshot installation MUST not produce silently inconsistent recovered state.
 
-## 7. Performance requirements
+## 7. Retry semantics
+
+**REQ-RETRY-001** — v1 PUT, DELETE, and deterministic single-shard batches MUST be safe for client retry after transport/routing failures because their command semantics are idempotent.
+
+**REQ-RETRY-002** — Request IDs MAY be used for correlation, but v1 does not promise general exactly-once execution for future non-idempotent commands.
+
+**REQ-RETRY-003** — Any future non-idempotent mutation API MUST define replicated deduplication/exactly-once semantics in a new accepted spec before release.
+
+## 8. Performance requirements
 
 These are engineering targets rather than release claims until verified on controlled hardware.
 
@@ -94,7 +112,7 @@ These are engineering targets rather than release claims until verified on contr
 
 **REQ-PERF-006** — Performance comparisons MUST NOT imply equivalence when consistency or durability settings differ materially.
 
-## 8. Operability requirements
+## 9. Operability requirements
 
 **REQ-OPS-001** — The system MUST expose enough state to determine shard placement, current leader, term/epoch, commit/apply progress, and replica health.
 
@@ -102,11 +120,35 @@ These are engineering targets rather than release claims until verified on contr
 
 **REQ-OPS-003** — Backpressure MUST be explicit; overload MUST NOT grow unbounded request queues indefinitely.
 
-## 9. Language requirement
+## 10. Language requirement
 
 **REQ-LANG-001** — HomeKV v1 remains Rust-first unless controlled benchmark evidence demonstrates that a Zig component materially improves a stable hotspot while preserving equivalent semantics.
 
-## 10. Non-goals
+## 11. Benchmark authority
+
+**REQ-BENCH-AUTH-001** — Development/CI benchmarks MAY run on any recorded host, but public release performance claims require a dedicated, reproducible Linux benchmark profile with CPU frequency/power settings, topology, kernel, memory and network details recorded.
+
+**REQ-BENCH-AUTH-002** — The exact release benchmark machine is intentionally deferred to the comparative benchmark/release spec; this does not block M0/M1 engineering measurements as long as each result records its host metadata.
+
+## 12. Consensus dependency
+
+**REQ-RAFT-001** — The production v1 consensus core MUST use TiKV `raft-rs` rather than a bespoke Raft implementation. The exact pinned revision/version and integration contract are owned by the M3 child spec.
+
+**REQ-RAFT-002** — HomeKV owns the WAL, transport, state machine, scheduling, batching, observability and placement integration around the Raft core.
+
+## 13. Milestone boundaries
+
+**REQ-SDD-001** — M0 captures the immutable prototype benchmark baseline and MUST NOT optimize storage.
+
+**REQ-SDD-002** — M1 implements local shard-owned memory execution and MUST NOT introduce distributed consensus.
+
+**REQ-SDD-003** — M2 defines/implements the low-overhead data-plane protocol and routing semantics without making Multi-Raft a dependency.
+
+**REQ-SDD-004** — M3 proves one 3-replica shard with Raft, WAL durability, safe linearizable reads, failover and recovery.
+
+**REQ-SDD-005** — M4 scales the proven M3 machinery to the 1,024-shard placement/Multi-Raft architecture.
+
+## 14. Non-goals
 
 HomeKV v1 does not require:
 
@@ -117,13 +159,15 @@ HomeKV v1 does not require:
 - multi-master conflict resolution
 - follower reads under the default strong-consistency API
 - a full Redis-compatible command surface
+- custom production Raft
+- lease-based read optimization in the first replicated milestone
 
-## 11. Open questions before acceptance
+## 15. Acceptance decisions
 
-1. What exact logical shard count/range representation should v1 adopt?
-2. What durable acknowledgement contract should be the default: quorum WAL persistence, quorum memory + configurable persistence, or another explicit mode?
-3. Should the initial consensus implementation use an existing Rust Raft library or a minimal HomeKV implementation for educational/control reasons?
-4. What are the first authoritative benchmark hardware and workload profiles?
-5. Which client protocol semantics are required for redirects, retries, and request deduplication?
+The acceptance-time questions are resolved as follows:
 
-These must be resolved or deliberately deferred in `design.md` before this spec moves to Accepted.
+1. **Logical shard space:** 1,024 shards; `XXH3_64(key) & 1023`; fixed at cluster bootstrap in v1.
+2. **Durable acknowledgement:** quorum-persisted Raft state plus local leader apply before response.
+3. **Consensus core:** TiKV `raft-rs`; exact pinned revision and integration details belong to M3.
+4. **Benchmark authority:** M0 records actual host metadata; release-claim hardware is selected and frozen by the release/comparison spec.
+5. **Retries:** unconditional PUT/DELETE/deterministic batches are idempotent and retriable; general exactly-once semantics are out of v1 scope.
