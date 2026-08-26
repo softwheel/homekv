@@ -26,3 +26,8 @@ jobs:
           cargo run --bin hkvbench -- \
             --config benchmarks/configs/smoke-storage.json \
             --output target/hkvbench-smoke.json
+      - name: M0 memory accounting smoke
+        run: |
+          cargo run --bin hkvmem -- \
+            --config benchmarks/configs/smoke-storage.json \
+            --output target/hkvmem-smoke.json
