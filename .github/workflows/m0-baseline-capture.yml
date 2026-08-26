@@ -3,6 +3,8 @@ name: M0 Baseline Capture
 on:
   push:
     branches: ["spec-0002-bench-t6-capture"]
+  pull_request:
+    branches: ["main"]
 
 permissions:
   contents: read
@@ -76,15 +78,14 @@ jobs:
       - name: Validate exact SHA appears in result bundles
         run: |
           python3 - <<'PY'
-          import json, pathlib, sys
+          import json, pathlib
           expected = "e64b8d268858b58edfb2f6e83d9edfc3ad5b3b39"
           files = sorted(pathlib.Path("benchmarks/results/m0").glob("*.json"))
           if len(files) != 8:
               raise SystemExit(f"expected 8 result bundles, found {len(files)}")
           for path in files:
               data = json.loads(path.read_text())
-              text = json.dumps(data)
-              if expected not in text:
+              if expected not in json.dumps(data):
                   raise SystemExit(f"{path}: exact baseline SHA missing")
           print(f"validated {len(files)} result bundles at {expected}")
           PY
