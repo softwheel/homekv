@@ -46,3 +46,7 @@ path = "src/bin/hkvctl.rs"
 [[bin]]
 name = "hkvbench"
 path = "src/bin/hkvbench.rs"
+
+[[bin]]
+name = "hkvmem"
+path = "src/bin/hkvmem.rs"
