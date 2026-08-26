@@ -9,11 +9,11 @@ Implemented:
 - BENCH-T1 — deterministic config/result schema and percentile helpers
 - BENCH-T2 — storage-only `BTreeStore` + `Mvcc` baseline
 - BENCH-T3 — existing Tonic/Tokio server/RPC baseline with client concurrency 1/8/32
+- BENCH-T4 — low-intrusion process RSS / approximate bytes-per-key accounting
 - BENCH-T5 — bounded CI smoke mode
 
 Still required before Spec 0002 can become Verified:
 
-- BENCH-T4 — any additional memory/accounting metrics that are practical
 - BENCH-T6 — immutable full prototype result capture
 - BENCH-T7 — baseline analysis/summary
 
@@ -74,9 +74,60 @@ The harness preloads deterministic data through the public SET RPC before measur
 
 RPC failures and Tokio task/runtime failures are reported separately. `measured_operations` counts successful measured RPCs, while `attempted_operations` includes measured RPC attempts that returned an RPC failure. A worker task failure is reported in `runtime_failures`.
 
-The prototype server's existing per-request logging remains enabled. BENCH-T3 must preserve the server path rather than optimize it, so those costs are intentionally part of this historical baseline. The `process_rss_bytes` value in a server-layer result describes the `hkvbench` client process; server-process memory evidence belongs to BENCH-T4.
+The prototype server's existing per-request logging remains enabled. BENCH-T3 must preserve the server path rather than optimize it, so those costs are intentionally part of this historical baseline. The `process_rss_bytes` value in a server-layer result describes the `hkvbench` client process; server-process memory is measured separately by BENCH-T4.
 
 Repeat the full server run at least three times on the same controlled host and retain every run.
+
+## BENCH-T4 memory accounting
+
+`hkvmem` is a companion measurement probe. It deliberately uses process RSS rather than adding allocator hooks to the production server. Its output is evidence for memory scaling, not an exact heap-allocation profile.
+
+### Storage memory matrix
+
+```bash
+cargo run --release --bin hkvmem -- \
+  --config benchmarks/configs/baseline-storage.json \
+  --output benchmarks/results/m0/storage-memory.json
+```
+
+Each storage cell runs in a fresh `hkvmem` worker process. The worker samples its RSS before constructing the dataset and after the populated `Mvcc<BTreeStore>` is resident. This avoids carrying the allocator high-water mark from a larger preceding dataset into a smaller one.
+
+The result includes:
+
+- RSS before population;
+- RSS after population;
+- signed RSS delta;
+- approximate RSS bytes/key when the observed delta is positive;
+- logical key+value payload bytes;
+- RSS-delta / logical-payload ratio.
+
+Temporary deterministic key/value generation and allocator retention can affect the RSS delta. The probe preserves the observed value rather than fabricating an exact allocation number.
+
+### Server-process memory matrix
+
+Build the probe and server first so `hkvmem` can launch a fresh historical HomeKV server for every unique dataset:
+
+```bash
+cargo build --release --bin homekv --bin hkvmem
+
+target/release/hkvmem \
+  --config benchmarks/configs/baseline-server.json \
+  --homekv-bin target/release/homekv \
+  --output benchmarks/results/m0/server-memory.json
+```
+
+For every unique `(key_size, value_size, dataset_cardinality)` in the accepted server matrix, `hkvmem`:
+
+1. starts a fresh unmodified HomeKV Tonic/Tokio process on temporary loopback ports;
+2. waits for the public RPC endpoint to become ready;
+3. samples server-process RSS;
+4. preloads the deterministic dataset through the public SET RPC;
+5. samples server-process RSS again;
+6. terminates the isolated server before moving to the next dataset.
+
+Concurrency variants are intentionally deduplicated for this probe because they share the same resident dataset. Server stdout/stderr are redirected only so the prototype's historical per-request `println!` output cannot fill the measurement driver's pipe; the server implementation itself is not modified.
+
+On hosts without Linux `/proc/<pid>/status`, RSS fields are reported as `null` rather than guessed. Allocations/op remain deferred under REQ-BENCH-005 because adding a reliable low-intrusion allocator profiler is not necessary for the M0 acceptance gate.
 
 ## What is measured
 
@@ -101,4 +152,6 @@ Every result bundle is labeled:
 
 M0 is a single-node prototype baseline, not a distributed or strong-consistency benchmark. Public comparative HomeKV claims require the later distributed correctness and benchmark specs.
 
-The result includes the git SHA, Rust version, OS/kernel, CPU, logical CPU count, host memory where available, benchmark-process RSS where available, workload parameters, attempted/successful operation counts, throughput, p50/p95/p99 latency, and failure counters.
+The latency/throughput bundle includes the git SHA, Rust version, OS/kernel, CPU, logical CPU count, host memory where available, benchmark-process RSS where available, workload parameters, attempted/successful operation counts, throughput, p50/p95/p99 latency, and failure counters.
+
+The BENCH-T4 bundle separately records isolated storage/server RSS deltas and approximate bytes/key with explicit measurement limitations.
