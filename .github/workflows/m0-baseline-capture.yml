@@ -1,0 +1,99 @@
+name: M0 Baseline Capture
+
+on:
+  push:
+    branches: ["spec-0002-bench-t6-capture"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BASELINE_SHA: e64b8d268858b58edfb2f6e83d9edfc3ad5b3b39
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+      - name: Checkout exact pre-M1 baseline
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASELINE_SHA }}
+      - name: Verify immutable source revision
+        run: |
+          test "$(git rev-parse HEAD)" = "$BASELINE_SHA"
+          test -z "$(git status --porcelain)"
+      - name: Build release benchmark binaries
+        run: cargo build --release --bin homekv --bin hkvbench --bin hkvmem
+      - name: Capture repeated storage baseline
+        run: |
+          mkdir -p benchmarks/results/m0
+          for run in 1 2 3; do
+            target/release/hkvbench \
+              --config benchmarks/configs/baseline-storage.json \
+              --output "benchmarks/results/m0/storage-run-${run}.json"
+          done
+      - name: Capture repeated server baseline
+        run: |
+          target/release/homekv \
+            --host 127.0.0.1 \
+            --port 20001 \
+            --public_host 127.0.0.1 \
+            --gossip_port 20002 \
+            > target/m0-homekv-server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 60); do
+            if target/release/hkvbench \
+              --config benchmarks/configs/smoke-server.json \
+              --output target/server-ready-smoke.json >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              echo "server did not become ready" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          for run in 1 2 3; do
+            target/release/hkvbench \
+              --config benchmarks/configs/baseline-server.json \
+              --output "benchmarks/results/m0/server-run-${run}.json"
+          done
+      - name: Capture memory evidence
+        run: |
+          target/release/hkvmem \
+            --config benchmarks/configs/baseline-storage.json \
+            --output benchmarks/results/m0/storage-memory.json
+          target/release/hkvmem \
+            --config benchmarks/configs/baseline-server.json \
+            --homekv-bin target/release/homekv \
+            --output benchmarks/results/m0/server-memory.json
+      - name: Validate exact SHA appears in result bundles
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, sys
+          expected = "e64b8d268858b58edfb2f6e83d9edfc3ad5b3b39"
+          files = sorted(pathlib.Path("benchmarks/results/m0").glob("*.json"))
+          if len(files) != 8:
+              raise SystemExit(f"expected 8 result bundles, found {len(files)}")
+          for path in files:
+              data = json.loads(path.read_text())
+              text = json.dumps(data)
+              if expected not in text:
+                  raise SystemExit(f"{path}: exact baseline SHA missing")
+          print(f"validated {len(files)} result bundles at {expected}")
+          PY
+      - name: Upload immutable M0 result bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: homekv-m0-baseline-${{ env.BASELINE_SHA }}
+          path: |
+            benchmarks/results/m0/*.json
+            target/m0-homekv-server.log
+          if-no-files-found: error
+          retention-days: 90
