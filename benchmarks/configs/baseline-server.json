@@ -8,7 +8,7 @@
   "server": {
     "endpoint": "http://127.0.0.1:20001",
     "duration_ms": 5000,
-    "preload_batch_size": 8192,
+    "preload_batch_size": 2048,
     "cases": [
       { "key_size": 16, "value_size": 64, "dataset_cardinality": 1000, "concurrency": 1 },
       { "key_size": 16, "value_size": 64, "dataset_cardinality": 1000, "concurrency": 8 },
