@@ -11,7 +11,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BASELINE_SHA: e64b8d268858b58edfb2f6e83d9edfc3ad5b3b39
+  BASELINE_SHA: bc613b74e8c718a7d002f1cacbd8d51cddbf3067
 
 jobs:
   capture:
@@ -31,21 +31,6 @@ jobs:
           test -z "$(git status --porcelain)"
       - name: Build release benchmark binaries
         run: cargo build --release --bin homekv --bin hkvbench --bin hkvmem
-      - name: Prepare capture-only server preload config
-        run: |
-          python3 - <<'PY'
-          import json, pathlib
-          source = pathlib.Path("benchmarks/configs/baseline-server.json")
-          target = pathlib.Path("target/m0-baseline-server-capture.json")
-          data = json.loads(source.read_text())
-          # Preload is outside the measured window. The accepted 8,192-record
-          # batch exceeds Tonic's default 4 MiB message limit for the 1 KiB
-          # payload-sensitivity cell, so BENCH-T6 uses a smaller capture-only
-          # batch without changing any measured workload dimensions/semantics.
-          data["server"]["preload_batch_size"] = 1024
-          target.write_text(json.dumps(data, indent=2) + "\n")
-          print(f"capture preload_batch_size={data['server']['preload_batch_size']}")
-          PY
       - name: Capture repeated storage baseline
         run: |
           mkdir -p benchmarks/results/m0
@@ -93,7 +78,7 @@ jobs:
             done
 
             target/release/hkvbench \
-              --config target/m0-baseline-server-capture.json \
+              --config benchmarks/configs/baseline-server.json \
               --output "benchmarks/results/m0/server-run-${run}.json" \
               >/dev/null
 
@@ -109,7 +94,7 @@ jobs:
             --output benchmarks/results/m0/storage-memory.json \
             >/dev/null
           target/release/hkvmem \
-            --config target/m0-baseline-server-capture.json \
+            --config benchmarks/configs/baseline-server.json \
             --homekv-bin target/release/homekv \
             --output benchmarks/results/m0/server-memory.json \
             >/dev/null
@@ -117,7 +102,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import json, pathlib
-          expected = "e64b8d268858b58edfb2f6e83d9edfc3ad5b3b39"
+          expected = "bc613b74e8c718a7d002f1cacbd8d51cddbf3067"
           root = pathlib.Path("benchmarks/results/m0")
           files = sorted(root.glob("*.json"))
           if len(files) != 8:
@@ -141,7 +126,6 @@ jobs:
           name: homekv-m0-baseline-${{ env.BASELINE_SHA }}
           path: |
             benchmarks/results/m0/*.json
-            target/m0-baseline-server-capture.json
             target/m0-homekv-server-run-*.log.gz
           if-no-files-found: error
           retention-days: 90
