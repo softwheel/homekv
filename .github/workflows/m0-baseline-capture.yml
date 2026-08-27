@@ -31,63 +31,109 @@ jobs:
           test -z "$(git status --porcelain)"
       - name: Build release benchmark binaries
         run: cargo build --release --bin homekv --bin hkvbench --bin hkvmem
+      - name: Prepare capture-only server preload config
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          source = pathlib.Path("benchmarks/configs/baseline-server.json")
+          target = pathlib.Path("target/m0-baseline-server-capture.json")
+          data = json.loads(source.read_text())
+          # Preload is outside the measured window. The accepted 8,192-record
+          # batch exceeds Tonic's default 4 MiB message limit for the 1 KiB
+          # payload-sensitivity cell, so BENCH-T6 uses a smaller capture-only
+          # batch without changing any measured workload dimensions/semantics.
+          data["server"]["preload_batch_size"] = 1024
+          target.write_text(json.dumps(data, indent=2) + "\n")
+          print(f"capture preload_batch_size={data['server']['preload_batch_size']}")
+          PY
       - name: Capture repeated storage baseline
         run: |
           mkdir -p benchmarks/results/m0
           for run in 1 2 3; do
             target/release/hkvbench \
               --config benchmarks/configs/baseline-storage.json \
-              --output "benchmarks/results/m0/storage-run-${run}.json"
+              --output "benchmarks/results/m0/storage-run-${run}.json" \
+              >/dev/null
           done
       - name: Capture repeated server baseline
         run: |
-          target/release/homekv \
-            --host 127.0.0.1 \
-            --port 20001 \
-            --public_host 127.0.0.1 \
-            --gossip_port 20002 \
-            > target/m0-homekv-server.log 2>&1 &
-          server_pid=$!
-          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
-          for attempt in $(seq 1 60); do
-            if target/release/hkvbench \
-              --config benchmarks/configs/smoke-server.json \
-              --output target/server-ready-smoke.json >/dev/null 2>&1; then
-              break
-            fi
-            if [ "$attempt" -eq 60 ]; then
-              echo "server did not become ready" >&2
-              exit 1
-            fi
-            sleep 1
-          done
           for run in 1 2 3; do
+            log="target/m0-homekv-server-run-${run}.log"
+            target/release/homekv \
+              --host 127.0.0.1 \
+              --port 20001 \
+              --public_host 127.0.0.1 \
+              --gossip_port 20002 \
+              > "$log" 2>&1 &
+            server_pid=$!
+
+            cleanup_server() {
+              kill "$server_pid" 2>/dev/null || true
+              wait "$server_pid" 2>/dev/null || true
+            }
+            trap cleanup_server EXIT
+
+            for attempt in $(seq 1 60); do
+              if target/release/hkvbench \
+                --config benchmarks/configs/smoke-server.json \
+                --output target/server-ready-smoke.json >/dev/null 2>&1; then
+                break
+              fi
+              if ! kill -0 "$server_pid" 2>/dev/null; then
+                echo "server exited before becoming ready; tail follows" >&2
+                tail -100 "$log" >&2 || true
+                exit 1
+              fi
+              if [ "$attempt" -eq 60 ]; then
+                echo "server did not become ready; tail follows" >&2
+                tail -100 "$log" >&2 || true
+                exit 1
+              fi
+              sleep 1
+            done
+
             target/release/hkvbench \
-              --config benchmarks/configs/baseline-server.json \
-              --output "benchmarks/results/m0/server-run-${run}.json"
+              --config target/m0-baseline-server-capture.json \
+              --output "benchmarks/results/m0/server-run-${run}.json" \
+              >/dev/null
+
+            cleanup_server
+            trap - EXIT
+            gzip -9 "$log"
+            sleep 1
           done
       - name: Capture memory evidence
         run: |
           target/release/hkvmem \
             --config benchmarks/configs/baseline-storage.json \
-            --output benchmarks/results/m0/storage-memory.json
+            --output benchmarks/results/m0/storage-memory.json \
+            >/dev/null
           target/release/hkvmem \
-            --config benchmarks/configs/baseline-server.json \
+            --config target/m0-baseline-server-capture.json \
             --homekv-bin target/release/homekv \
-            --output benchmarks/results/m0/server-memory.json
-      - name: Validate exact SHA appears in result bundles
+            --output benchmarks/results/m0/server-memory.json \
+            >/dev/null
+      - name: Validate captured result contract
         run: |
           python3 - <<'PY'
           import json, pathlib
           expected = "e64b8d268858b58edfb2f6e83d9edfc3ad5b3b39"
-          files = sorted(pathlib.Path("benchmarks/results/m0").glob("*.json"))
+          root = pathlib.Path("benchmarks/results/m0")
+          files = sorted(root.glob("*.json"))
           if len(files) != 8:
               raise SystemExit(f"expected 8 result bundles, found {len(files)}")
           for path in files:
               data = json.loads(path.read_text())
-              if expected not in json.dumps(data):
+              encoded = json.dumps(data)
+              if expected not in encoded:
                   raise SystemExit(f"{path}: exact baseline SHA missing")
-          print(f"validated {len(files)} result bundles at {expected}")
+              if data.get("authoritative_performance_result") is not False:
+                  raise SystemExit(f"{path}: M0 result must remain non-authoritative")
+          for prefix in ("storage-run-", "server-run-"):
+              matched = sorted(root.glob(f"{prefix}*.json"))
+              if len(matched) != 3:
+                  raise SystemExit(f"expected 3 {prefix} repetitions, found {len(matched)}")
+          print(f"validated {len(files)} immutable result bundles at {expected}")
           PY
       - name: Upload immutable M0 result bundle
         uses: actions/upload-artifact@v4
@@ -95,6 +141,7 @@ jobs:
           name: homekv-m0-baseline-${{ env.BASELINE_SHA }}
           path: |
             benchmarks/results/m0/*.json
-            target/m0-homekv-server.log
+            target/m0-baseline-server-capture.json
+            target/m0-homekv-server-run-*.log.gz
           if-no-files-found: error
           retention-days: 90
