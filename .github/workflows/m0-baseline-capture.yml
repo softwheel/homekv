@@ -1,0 +1,131 @@
+name: M0 Baseline Capture
+
+on:
+  push:
+    branches: ["spec-0002-bench-t6-capture"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BASELINE_SHA: bc613b74e8c718a7d002f1cacbd8d51cddbf3067
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+      - name: Checkout exact pre-M1 baseline
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASELINE_SHA }}
+      - name: Verify immutable source revision
+        run: |
+          test "$(git rev-parse HEAD)" = "$BASELINE_SHA"
+          test -z "$(git status --porcelain)"
+      - name: Build release benchmark binaries
+        run: cargo build --release --bin homekv --bin hkvbench --bin hkvmem
+      - name: Capture repeated storage baseline
+        run: |
+          mkdir -p benchmarks/results/m0
+          for run in 1 2 3; do
+            target/release/hkvbench \
+              --config benchmarks/configs/baseline-storage.json \
+              --output "benchmarks/results/m0/storage-run-${run}.json" \
+              >/dev/null
+          done
+      - name: Capture repeated server baseline
+        run: |
+          for run in 1 2 3; do
+            log="target/m0-homekv-server-run-${run}.log"
+            target/release/homekv \
+              --host 127.0.0.1 \
+              --port 20001 \
+              --public_host 127.0.0.1 \
+              --gossip_port 20002 \
+              > "$log" 2>&1 &
+            server_pid=$!
+
+            cleanup_server() {
+              kill "$server_pid" 2>/dev/null || true
+              wait "$server_pid" 2>/dev/null || true
+            }
+            trap cleanup_server EXIT
+
+            for attempt in $(seq 1 60); do
+              if target/release/hkvbench \
+                --config benchmarks/configs/smoke-server.json \
+                --output target/server-ready-smoke.json >/dev/null 2>&1; then
+                break
+              fi
+              if ! kill -0 "$server_pid" 2>/dev/null; then
+                echo "server exited before becoming ready; tail follows" >&2
+                tail -100 "$log" >&2 || true
+                exit 1
+              fi
+              if [ "$attempt" -eq 60 ]; then
+                echo "server did not become ready; tail follows" >&2
+                tail -100 "$log" >&2 || true
+                exit 1
+              fi
+              sleep 1
+            done
+
+            target/release/hkvbench \
+              --config benchmarks/configs/baseline-server.json \
+              --output "benchmarks/results/m0/server-run-${run}.json" \
+              >/dev/null
+
+            cleanup_server
+            trap - EXIT
+            gzip -9 "$log"
+            sleep 1
+          done
+      - name: Capture memory evidence
+        run: |
+          target/release/hkvmem \
+            --config benchmarks/configs/baseline-storage.json \
+            --output benchmarks/results/m0/storage-memory.json \
+            >/dev/null
+          target/release/hkvmem \
+            --config benchmarks/configs/baseline-server.json \
+            --homekv-bin target/release/homekv \
+            --output benchmarks/results/m0/server-memory.json \
+            >/dev/null
+      - name: Validate captured result contract
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          expected = "bc613b74e8c718a7d002f1cacbd8d51cddbf3067"
+          root = pathlib.Path("benchmarks/results/m0")
+          files = sorted(root.glob("*.json"))
+          if len(files) != 8:
+              raise SystemExit(f"expected 8 result bundles, found {len(files)}")
+          for path in files:
+              data = json.loads(path.read_text())
+              encoded = json.dumps(data)
+              if expected not in encoded:
+                  raise SystemExit(f"{path}: exact baseline SHA missing")
+              if data.get("authoritative_performance_result") is not False:
+                  raise SystemExit(f"{path}: M0 result must remain non-authoritative")
+          for prefix in ("storage-run-", "server-run-"):
+              matched = sorted(root.glob(f"{prefix}*.json"))
+              if len(matched) != 3:
+                  raise SystemExit(f"expected 3 {prefix} repetitions, found {len(matched)}")
+          print(f"validated {len(files)} immutable result bundles at {expected}")
+          PY
+      - name: Upload immutable M0 result bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: homekv-m0-baseline-${{ env.BASELINE_SHA }}
+          path: |
+            benchmarks/results/m0/*.json
+            target/m0-homekv-server-run-*.log.gz
+          if-no-files-found: error
+          retention-days: 90
