@@ -1,6 +1,6 @@
 # Spec 0002 — Baseline Benchmark Requirements
 
-- Status: Accepted
+- Status: Verified
 - Parent spec: `../0001-homekv-v1/`
 - Tracking issue: #8
 

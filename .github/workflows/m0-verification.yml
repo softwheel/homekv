@@ -1,0 +1,81 @@
+name: M0 Verification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "benchmarks/analyze_m0.py"
+      - "specs/0002-baseline-benchmark/**"
+      - ".github/workflows/m0-verification.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SOURCE_RUN_ID: "33080513696"
+  ARTIFACT_ID: "9650486609"
+  ARTIFACT_NAME: "homekv-m0-baseline-bc613b74e8c718a7d002f1cacbd8d51cddbf3067"
+  ARTIFACT_DIGEST: "sha256:015faf8d87c8d197457ca9c6fd2f2c8d1ab07dc0bc16a2e62a2517335331680c"
+  BASELINE_SHA: "bc613b74e8c718a7d002f1cacbd8d51cddbf3067"
+
+jobs:
+  verify-retained-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout BENCH-T7 tooling
+        uses: actions/checkout@v4
+
+      - name: Verify retained artifact identity
+        run: |
+          gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" \
+            > "$RUNNER_TEMP/m0-artifact.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+
+          data = json.loads((pathlib.Path(os.environ["RUNNER_TEMP"]) / "m0-artifact.json").read_text())
+          expected = {
+              "id": int(os.environ["ARTIFACT_ID"]),
+              "name": os.environ["ARTIFACT_NAME"],
+              "digest": os.environ["ARTIFACT_DIGEST"],
+          }
+          for key, value in expected.items():
+              if data.get(key) != value:
+                  raise SystemExit(f"artifact {key} mismatch: {data.get(key)!r} != {value!r}")
+          if data.get("expired") is not False:
+              raise SystemExit("retained M0 artifact is expired")
+          run = data.get("workflow_run") or {}
+          if int(run.get("id", -1)) != int(os.environ["SOURCE_RUN_ID"]):
+              raise SystemExit(f"artifact run mismatch: {run.get('id')!r}")
+          print("retained M0 artifact identity verified")
+          PY
+
+      - name: Download retained T6 evidence
+        run: |
+          rm -rf target/m0-retained
+          mkdir -p target/m0-retained
+          gh run download "$SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$ARTIFACT_NAME" \
+            --dir target/m0-retained
+
+      - name: Analyze retained M0 results
+        run: |
+          python3 benchmarks/analyze_m0.py \
+            --input target/m0-retained/benchmarks/results/m0 \
+            --output target/m0-analysis.md \
+            --baseline-sha "$BASELINE_SHA"
+          cat target/m0-analysis.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload derived BENCH-T7 report
+        uses: actions/upload-artifact@v4
+        with:
+          name: homekv-m0-analysis-${{ env.BASELINE_SHA }}
+          path: target/m0-analysis.md
+          if-no-files-found: error
+          retention-days: 90
