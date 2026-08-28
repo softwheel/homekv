@@ -1,10 +1,7 @@
 name: M0 Baseline Capture
 
 on:
-  push:
-    branches: ["spec-0002-bench-t6-capture"]
-  pull_request:
-    branches: ["main"]
+  workflow_dispatch:
 
 permissions:
   contents: read
