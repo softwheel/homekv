@@ -1,6 +1,6 @@
 # Spec 0002 — Baseline Benchmark Design
 
-- Status: Accepted
+- Status: Verified
 - Requirements: `requirements.md`
 - Tracking issue: #8
 
