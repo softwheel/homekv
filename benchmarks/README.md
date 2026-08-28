@@ -2,20 +2,21 @@
 
 This directory implements Spec 0002 (M0 prototype baseline).
 
-## Current slice
+## M0 status
 
-Implemented:
+Spec 0002 is **Verified** on the BENCH-T7 verification branch pending merge.
+
+Completed:
 
 - BENCH-T1 — deterministic config/result schema and percentile helpers
 - BENCH-T2 — storage-only `BTreeStore` + `Mvcc` baseline
 - BENCH-T3 — existing Tonic/Tokio server/RPC baseline with client concurrency 1/8/32
 - BENCH-T4 — low-intrusion process RSS / approximate bytes-per-key accounting
 - BENCH-T5 — bounded CI smoke mode
+- BENCH-T6 — immutable repeated full prototype capture
+- BENCH-T7 — retained-artifact analysis and verification handoff
 
-Still required before Spec 0002 can become Verified:
-
-- BENCH-T6 — immutable full prototype result capture
-- BENCH-T7 — baseline analysis/summary
+The durable analysis and caveats live in [`specs/0002-baseline-benchmark/m0-analysis.md`](../specs/0002-baseline-benchmark/m0-analysis.md). The exact retained artifact is revalidated by `.github/workflows/m0-verification.yml` and analyzed by `benchmarks/analyze_m0.py`.
 
 No M1 storage optimization belongs in M0.
 
@@ -128,6 +129,31 @@ For every unique `(key_size, value_size, dataset_cardinality)` in the accepted s
 Concurrency variants are intentionally deduplicated for this probe because they share the same resident dataset. Server stdout/stderr are redirected only so the prototype's historical per-request `println!` output cannot fill the measurement driver's pipe; the server implementation itself is not modified.
 
 On hosts without Linux `/proc/<pid>/status`, RSS fields are reported as `null` rather than guessed. Allocations/op remain deferred under REQ-BENCH-005 because adding a reliable low-intrusion allocator profiler is not necessary for the M0 acceptance gate.
+
+## BENCH-T6 retained baseline
+
+The immutable M0 comparison point is:
+
+- baseline SHA: `bc613b74e8c718a7d002f1cacbd8d51cddbf3067`
+- workflow run: `33080513696`
+- artifact id: `9650486609`
+- artifact name: `homekv-m0-baseline-bc613b74e8c718a7d002f1cacbd8d51cddbf3067`
+- digest: `sha256:015faf8d87c8d197457ca9c6fd2f2c8d1ab07dc0bc16a2e62a2517335331680c`
+
+The capture contains three complete storage runs, three complete server runs, storage/server memory evidence, and the historical server logs. It must not be replaced by a later M1 run.
+
+## BENCH-T7 analysis
+
+To analyze the exact retained T6 result bundles rather than recapturing on a different runner:
+
+```bash
+python3 benchmarks/analyze_m0.py \
+  --input <downloaded-artifact>/benchmarks/results/m0 \
+  --output target/m0-analysis.md \
+  --baseline-sha bc613b74e8c718a7d002f1cacbd8d51cddbf3067
+```
+
+The `M0 Verification` GitHub Actions workflow verifies the retained artifact id/name/digest/run identity, downloads that exact artifact, executes the analyzer, and publishes the derived report to the job summary.
 
 ## What is measured
 
