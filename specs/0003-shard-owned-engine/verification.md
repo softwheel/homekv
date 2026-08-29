@@ -1,6 +1,6 @@
 # Spec 0003 — Shard-Owned In-Memory Engine Verification
 
-- Status: Review
+- Status: Accepted
 - Requirements: `requirements.md`
 - Design: `design.md`
 - Tracking issue: #9
