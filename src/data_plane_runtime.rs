@@ -353,8 +353,6 @@ where
     let writer_task = tokio::spawn(write_responses(writer, response_rx, writer_metrics));
 
     let read_result = loop {
-        // Acquire before advancing application reads. At saturation, no additional
-        // request frame is staged in userspace beyond the kernel/transport buffer.
         let permit = match semaphore.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => break Ok(()),
@@ -946,7 +944,10 @@ mod tests {
             server,
             handler,
             test_codec_limits(),
-            runtime_limits(),
+            RuntimeLimits {
+                max_in_flight: 3,
+                response_queue_capacity: 3,
+            },
             metrics.clone(),
         ));
 
@@ -955,9 +956,12 @@ mod tests {
         assert_eq!(started_rx.recv().await, Some(80));
         assert_eq!(started_rx.recv().await, Some(81));
         write_request(&mut client, 80).await;
+        let duplicate = read_response(&mut client).await;
+        assert_eq!(duplicate.request_id, 80);
+        assert_eq!(duplicate.status, Status::DuplicateInflightRequestId);
 
         release.add_permits(2);
-        for _ in 0..3 {
+        for _ in 0..2 {
             let _ = read_response(&mut client).await;
         }
         drop(client);
