@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use super::{shard_for_key, Mutation, ShardBatch, ShardEngine, ShardEngineError, ShardEngineResult, ShardId, LOGICAL_SHARD_COUNT};
+use super::{
+    shard_for_key, Mutation, ShardBatch, ShardEngine, ShardEngineError, ShardEngineResult, ShardId,
+    LOGICAL_SHARD_COUNT,
+};
 
 pub const DEFAULT_SHARD_QUEUE_CAPACITY: usize = 1024;
 
@@ -21,7 +24,12 @@ impl ShardStore {
     pub fn spawn(queue_capacity: usize) -> Self {
         assert!(queue_capacity > 0, "shard queue capacity must be positive");
         let shards = (0..LOGICAL_SHARD_COUNT)
-            .map(|id| ShardEngine::spawn(ShardId::new(id).expect("bounded logical shard id"), queue_capacity))
+            .map(|id| {
+                ShardEngine::spawn(
+                    ShardId::new(id).expect("bounded logical shard id"),
+                    queue_capacity,
+                )
+            })
             .collect();
         Self { shards }
     }
@@ -34,8 +42,50 @@ impl ShardStore {
         &self.shards[shard_for_key(key).as_u16() as usize]
     }
 
+    fn declared_shard(&self, shard_id: u16) -> ShardEngineResult<&ShardEngine> {
+        let shard_id = ShardId::new(shard_id)?;
+        Ok(&self.shards[shard_id.as_u16() as usize])
+    }
+
     pub async fn get(&self, key: &[u8]) -> ShardEngineResult<Option<Vec<u8>>> {
         self.shard(key).get(key).await
+    }
+
+    pub async fn try_get_on_shard(
+        &self,
+        shard_id: u16,
+        key: &[u8],
+    ) -> ShardEngineResult<Option<Vec<u8>>> {
+        self.declared_shard(shard_id)?.try_get(key).await
+    }
+
+    pub async fn try_put_on_shard(
+        &self,
+        shard_id: u16,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> ShardEngineResult<()> {
+        self.declared_shard(shard_id)?.try_put(key, value).await
+    }
+
+    pub async fn try_delete_on_shard(
+        &self,
+        shard_id: u16,
+        key: Vec<u8>,
+    ) -> ShardEngineResult<()> {
+        self.declared_shard(shard_id)?.try_delete(key).await
+    }
+
+    pub async fn try_apply_batch_on_shard(
+        &self,
+        shard_id: u16,
+        mutations: Vec<Mutation>,
+    ) -> ShardEngineResult<()> {
+        let shard_id = ShardId::new(shard_id)?;
+        let batch = ShardBatch::new(shard_id, mutations)?;
+        self.shards[shard_id.as_u16() as usize]
+            .try_apply_batch(batch)
+            .await
     }
 
     pub async fn get_many(&self, keys: &[Vec<u8>]) -> ShardEngineResult<Vec<Option<Vec<u8>>>> {
@@ -46,7 +96,10 @@ impl ShardStore {
         Ok(values)
     }
 
-    pub async fn set_many(&self, records: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> ShardEngineResult<()> {
+    pub async fn set_many(
+        &self,
+        records: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> ShardEngineResult<()> {
         let mut by_shard: BTreeMap<u16, Vec<Mutation>> = BTreeMap::new();
         for (key, value) in records {
             let shard_id = shard_for_key(&key).as_u16();
@@ -59,13 +112,16 @@ impl ShardStore {
         for (shard_id, mutations) in by_shard {
             let shard_id = ShardId::new(shard_id)?;
             let batch = ShardBatch::new(shard_id, mutations)?;
-            self.shards[shard_id.as_u16() as usize].apply_batch(batch).await?;
+            self.shards[shard_id.as_u16() as usize]
+                .apply_batch(batch)
+                .await?;
         }
         Ok(())
     }
 
     pub async fn delete_many(&self, keys: Vec<Vec<u8>>) -> ShardEngineResult<()> {
-        self.set_many(keys.into_iter().map(|key| (key, None)).collect()).await
+        self.set_many(keys.into_iter().map(|key| (key, None)).collect())
+            .await
     }
 
     pub async fn metrics(&self) -> ShardEngineResult<ShardStoreMetrics> {
@@ -130,13 +186,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.get_many(&[key_a.clone(), key_b.clone()]).await.unwrap(),
+            store
+                .get_many(&[key_a.clone(), key_b.clone()])
+                .await
+                .unwrap(),
             vec![Some(b"one".to_vec()), Some(b"two".to_vec())]
         );
 
         store.delete_many(vec![key_a.clone()]).await.unwrap();
         assert_eq!(store.get(&key_a).await.unwrap(), None);
         assert_eq!(store.get(&key_b).await.unwrap(), Some(b"two".to_vec()));
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn declared_shard_primitives_reject_wrong_shard_before_admission() {
+        let store = ShardStore::spawn(8);
+        let key = b"declared-shard".to_vec();
+        let actual = shard_for_key(&key).as_u16();
+        let wrong = (actual + 1) % LOGICAL_SHARD_COUNT;
+
+        assert!(matches!(
+            store.try_get_on_shard(wrong, &key).await,
+            Err(ShardEngineError::WrongShard { .. })
+        ));
+        assert!(matches!(
+            store
+                .try_put_on_shard(wrong, key.clone(), b"value".to_vec())
+                .await,
+            Err(ShardEngineError::WrongShard { .. })
+        ));
+        assert_eq!(store.get(&key).await.unwrap(), None);
         store.shutdown().await.unwrap();
     }
 
@@ -154,7 +234,10 @@ mod tests {
             .await
             .unwrap();
 
-        let metrics = store.shards[shard.as_u16() as usize].metrics().await.unwrap();
+        let metrics = store.shards[shard.as_u16() as usize]
+            .metrics()
+            .await
+            .unwrap();
         assert_eq!(metrics.key_count, 2);
         assert_eq!(metrics.applied_mutations, 2);
         store.shutdown().await.unwrap();
