@@ -1,6 +1,6 @@
 # Spec 0003 — Shard-Owned In-Memory Engine Requirements
 
-- Status: Review
+- Status: Accepted
 - Parent spec: `../0001-homekv-v1/`
 - Depends on: verified Spec 0002 / M0 baseline
 - Tracking issue: #9
