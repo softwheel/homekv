@@ -31,6 +31,7 @@ rand = { version = "0.8", features = ["small_rng"] }
 md-5 = "0.10.6"
 cool-id-generator = "1.0.1"
 structopt = "0.3.26"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [build-dependencies]
 tonic-build = "0.12.1"
