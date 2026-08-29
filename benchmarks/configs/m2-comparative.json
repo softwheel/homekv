@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "seed": 42,
+  "grpc_endpoint": "http://127.0.0.1:21001",
+  "compact_endpoint": "127.0.0.1:21002",
+  "key_size": 16,
+  "value_size": 64,
+  "dataset_cardinality": 50000,
+  "pipeline_depths": [1, 32],
+  "workloads": ["get", "set", "delete", "read80_write20"],
+  "warmup_operations": 1000,
+  "measured_operations": 10000
+}
