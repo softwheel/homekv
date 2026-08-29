@@ -1,0 +1,45 @@
+name: M1 Shard Benchmark
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/bin/hkvshardbench.rs'
+      - 'src/storage/**'
+      - 'benchmarks/configs/*shard.json'
+      - 'benchmarks/analyze_m1.py'
+      - '.github/workflows/m1-benchmark.yml'
+
+jobs:
+  shard-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and test
+        run: |
+          cargo build --all-targets
+          cargo test --all-targets
+      - name: Smoke shard harness
+        run: cargo run --release --bin hkvshardbench -- --config benchmarks/configs/smoke-shard.json --output target/m1-shard-smoke.json
+      - name: Capture three complete M1 runs
+        run: |
+          mkdir -p target/m1
+          for run in 1 2 3; do
+            cargo run --release --bin hkvshardbench -- \
+              --config benchmarks/configs/baseline-shard.json \
+              --output target/m1/shard-run-${run}.json >/dev/null
+          done
+      - name: Evaluate frozen M1 gates
+        run: python3 benchmarks/analyze_m1.py target/m1/shard-run-1.json target/m1/shard-run-2.json target/m1/shard-run-3.json | tee target/m1/analysis.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: homekv-m1-shard-${{ github.sha }}
+          path: |
+            target/m1/*.json
+            target/m1/analysis.txt
+            target/m1-shard-smoke.json
+          if-no-files-found: error
