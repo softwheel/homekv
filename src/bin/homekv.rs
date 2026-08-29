@@ -238,7 +238,8 @@ fn compact_limits(opt: &Opt) -> Result<(CodecLimits, RuntimeLimits), Box<dyn std
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::from_args();
     let server_addr = format!("{}:{}", opt.host, opt.port).parse()?;
-    let compact_addr = format!("{}:{}", opt.compact_host, opt.compact_port).parse()?;
+    let compact_addr: std::net::SocketAddr =
+        format!("{}:{}", opt.compact_host, opt.compact_port).parse()?;
     let gossip_addr = format!("{}:{}", opt.public_host, opt.gossip_port).parse()?;
     let (codec_limits, runtime_limits) = compact_limits(&opt)?;
 
