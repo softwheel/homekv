@@ -18,6 +18,7 @@ clap = { version = "4.5.13", features = ["derive"] }
 atomic-counter = "1.0.1"
 tokio = { version = "1.39.2", features = [
     "net",
+    "io-util",
     "sync",
     "rt-multi-thread",
     "macros",
