@@ -4,7 +4,9 @@ pub mod shard_engine;
 
 pub use btree_store::BTreeStore;
 pub use mvcc::Mvcc;
-pub use shard_engine::{shard_for_key, Mutation, ShardEngine, ShardEngineError, ShardId};
+pub use shard_engine::{
+    shard_for_key, Mutation, ShardBatch, ShardEngine, ShardEngineError, ShardId, ShardMetrics,
+};
 
 use crate::common::Result;
 
