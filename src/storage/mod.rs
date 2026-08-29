@@ -1,12 +1,15 @@
 pub mod btree_store;
 pub mod mvcc;
 pub mod shard_engine;
+pub mod shard_store;
 
 pub use btree_store::BTreeStore;
 pub use mvcc::Mvcc;
 pub use shard_engine::{
-    shard_for_key, Mutation, ShardBatch, ShardEngine, ShardEngineError, ShardId, ShardMetrics,
+    shard_for_key, Mutation, ShardBatch, ShardEngine, ShardEngineError, ShardEngineResult, ShardId,
+    ShardMetrics, LOGICAL_SHARD_COUNT,
 };
+pub use shard_store::{ShardStore, ShardStoreMetrics, DEFAULT_SHARD_QUEUE_CAPACITY};
 
 use crate::common::Result;
 
