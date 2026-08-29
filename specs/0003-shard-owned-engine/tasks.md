@@ -1,11 +1,11 @@
 # Spec 0003 — Shard-Owned In-Memory Engine Tasks
 
-- Status: Review
+- Status: Accepted
 - Requirements: `requirements.md`
 - Design: `design.md`
 - Tracking issue: #9
 
-Implementation MUST NOT begin until this spec is Accepted.
+Implementation may begin because this spec is Accepted.
 
 ## M1-T1 — Logical shard identity and mapping
 
