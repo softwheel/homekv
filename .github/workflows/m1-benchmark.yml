@@ -19,15 +19,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build and test
         run: |
-          cargo build --locked --all-targets
-          cargo test --locked --all-targets
+          cargo build --all-targets
+          cargo test --all-targets
       - name: Smoke shard harness
-        run: cargo run --locked --release --bin hkvshardbench -- --config benchmarks/configs/smoke-shard.json --output target/m1-shard-smoke.json
+        run: cargo run --release --bin hkvshardbench -- --config benchmarks/configs/smoke-shard.json --output target/m1-shard-smoke.json
       - name: Capture three complete M1 runs
         run: |
           mkdir -p target/m1
           for run in 1 2 3; do
-            cargo run --locked --release --bin hkvshardbench -- \
+            cargo run --release --bin hkvshardbench -- \
               --config benchmarks/configs/baseline-shard.json \
               --output target/m1/shard-run-${run}.json >/dev/null
           done
