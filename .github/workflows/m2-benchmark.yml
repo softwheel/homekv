@@ -1,0 +1,80 @@
+name: M2 Comparative Benchmark
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/bin/hkvm2bench.rs'
+      - 'benchmarks/configs/m2-comparative.json'
+      - 'benchmarks/analyze_m2.py'
+      - '.github/workflows/m2-benchmark.yml'
+      - 'src/data_plane.rs'
+      - 'src/data_plane_runtime.rs'
+      - 'src/data_plane_adapter.rs'
+      - 'src/bin/homekv.rs'
+
+jobs:
+  comparative-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and test
+        run: |
+          cargo build --all-targets
+          cargo test --all-targets
+      - name: Start shared local HomeKV server
+        run: |
+          cargo run --release --bin homekv -- \
+            --host 127.0.0.1 --port 21001 \
+            --compact_host 127.0.0.1 --compact_port 21002 \
+            --public_host 127.0.0.1 --gossip_port 21003 \
+            > target/m2-homekv.log 2>&1 &
+          echo $! > target/m2-homekv.pid
+          python3 - <<'PY'
+          import socket, time
+          for port in (21001, 21002):
+              deadline = time.time() + 60
+              while time.time() < deadline:
+                  try:
+                      with socket.create_connection(('127.0.0.1', port), timeout=1):
+                          break
+                  except OSError:
+                      time.sleep(0.25)
+              else:
+                  raise SystemExit(f'HomeKV port {port} did not become ready')
+          PY
+      - name: Capture three complete M2 comparative runs
+        run: |
+          mkdir -p target/m2
+          for run in 1 2 3; do
+            cargo run --release --bin hkvm2bench -- \
+              --config benchmarks/configs/m2-comparative.json \
+              --output target/m2/run-${run}.json >/dev/null
+          done
+      - name: Evaluate M2 comparative evidence
+        run: |
+          python3 benchmarks/analyze_m2.py \
+            target/m2/run-1.json target/m2/run-2.json target/m2/run-3.json \
+            | tee target/m2/analysis.txt
+      - name: Stop local server
+        if: always()
+        run: |
+          if [ -f target/m2-homekv.pid ]; then
+            kill "$(cat target/m2-homekv.pid)" 2>/dev/null || true
+          fi
+          if [ -f target/m2-homekv.log ]; then
+            tail -n 100 target/m2-homekv.log > target/m2/server-tail.log || true
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: homekv-m2-comparative-${{ github.sha }}
+          path: |
+            target/m2/run-*.json
+            target/m2/analysis.txt
+            target/m2/server-tail.log
+          if-no-files-found: warn
