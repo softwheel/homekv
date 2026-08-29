@@ -3,10 +3,14 @@ use std::time::Duration;
 
 use atomic_counter::{AtomicCounter, RelaxedCounter};
 use structopt::StructOpt;
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tonic::transport::Server;
 use tonic::{Code, Request, Response, Status};
 
+use homekv::data_plane::CodecLimits;
+use homekv::data_plane_adapter::ShardRequestHandler;
+use homekv::data_plane_runtime::{serve_listener, RuntimeLimits};
 use homekv::honey_bees::failure_detector::FailureDetectorConfig;
 use homekv::honey_bees::server::spawn_gossip;
 use homekv::honey_bees::transport::UdpTransport;
@@ -38,16 +42,31 @@ impl StoreStatus {
 pub struct HomeKvServer {
     store: ShardStore,
     status: StoreStatus,
-    honey_bees: Arc<Mutex<HoneyBees>>,
+    _honey_bees: Option<Arc<Mutex<HoneyBees>>>,
 }
 
 impl HomeKvServer {
-    pub fn with_honey_bees(honey_bees: Arc<Mutex<HoneyBees>>) -> Self {
+    pub fn with_store(store: ShardStore) -> Self {
         HomeKvServer {
-            store: ShardStore::spawn_default(),
+            store,
             status: StoreStatus::new(),
-            honey_bees,
+            _honey_bees: None,
         }
+    }
+
+    pub fn with_store_and_honey_bees(
+        store: ShardStore,
+        honey_bees: Arc<Mutex<HoneyBees>>,
+    ) -> Self {
+        HomeKvServer {
+            store,
+            status: StoreStatus::new(),
+            _honey_bees: Some(honey_bees),
+        }
+    }
+
+    pub fn with_honey_bees(honey_bees: Arc<Mutex<HoneyBees>>) -> Self {
+        Self::with_store_and_honey_bees(ShardStore::spawn_default(), honey_bees)
     }
 
     fn storage_error() -> Status {
@@ -156,6 +175,26 @@ struct Opt {
     // Defines the server port
     #[structopt(long = "port", default_value = "20001")]
     port: u32,
+    // Defines the compact data-plane bind host.
+    #[structopt(long = "compact_host", default_value = "127.0.0.1")]
+    compact_host: String,
+    // Defines the compact data-plane port.
+    #[structopt(long = "compact_port", default_value = "20003")]
+    compact_port: u32,
+    #[structopt(long = "compact_max_frame", default_value = "8388608")]
+    compact_max_frame: usize,
+    #[structopt(long = "compact_max_key", default_value = "65536")]
+    compact_max_key: usize,
+    #[structopt(long = "compact_max_value", default_value = "4194304")]
+    compact_max_value: usize,
+    #[structopt(long = "compact_max_batch_mutations", default_value = "1024")]
+    compact_max_batch_mutations: usize,
+    #[structopt(long = "compact_max_batch_payload", default_value = "8388608")]
+    compact_max_batch_payload: usize,
+    #[structopt(long = "compact_max_in_flight", default_value = "256")]
+    compact_max_in_flight: usize,
+    #[structopt(long = "compact_response_queue_capacity", default_value = "256")]
+    compact_response_queue_capacity: usize,
     // Defines the public host, which other servers will use to
     // reach to this server.
     #[structopt(long = "public_host")]
@@ -171,11 +210,39 @@ struct Opt {
     gossip_interval: u64,
 }
 
+fn compact_limits(opt: &Opt) -> Result<(CodecLimits, RuntimeLimits), Box<dyn std::error::Error>> {
+    if opt.compact_max_frame == 0
+        || opt.compact_max_key == 0
+        || opt.compact_max_value == 0
+        || opt.compact_max_batch_mutations == 0
+        || opt.compact_max_batch_payload == 0
+    {
+        return Err("compact codec limits must be positive".into());
+    }
+    let codec_limits = CodecLimits {
+        max_frame: opt.compact_max_frame,
+        max_key: opt.compact_max_key,
+        max_value: opt.compact_max_value,
+        max_batch_mutations: opt.compact_max_batch_mutations,
+        max_batch_payload: opt.compact_max_batch_payload,
+    };
+    let runtime_limits = RuntimeLimits {
+        max_in_flight: opt.compact_max_in_flight,
+        response_queue_capacity: opt.compact_response_queue_capacity,
+    }
+    .validate()?;
+    Ok((codec_limits, runtime_limits))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::from_args();
     let server_addr = format!("{}:{}", opt.host, opt.port).parse()?;
+    let compact_addr: std::net::SocketAddr =
+        format!("{}:{}", opt.compact_host, opt.compact_port).parse()?;
     let gossip_addr = format!("{}:{}", opt.public_host, opt.gossip_port).parse()?;
+    let (codec_limits, runtime_limits) = compact_limits(&opt)?;
+
     let node = HoneyBee::new(gossip_addr);
     let config = GossipConfig {
         node,
@@ -188,12 +255,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let gossip_handler = spawn_gossip(config, Vec::new(), &UdpTransport).await?;
     let honey_bees = gossip_handler.honey_bees();
-    let homekv = HomeKvServer::with_honey_bees(honey_bees);
 
-    Server::builder()
+    let store = ShardStore::spawn_default();
+    let homekv = HomeKvServer::with_store_and_honey_bees(store.clone(), honey_bees);
+    let compact_handler = Arc::new(ShardRequestHandler::local(store.clone()));
+    let compact_listener = TcpListener::bind(compact_addr).await?;
+    let compact_task = tokio::spawn(serve_listener(
+        compact_listener,
+        compact_handler,
+        codec_limits,
+        runtime_limits,
+    ));
+
+    let grpc_result = Server::builder()
         .add_service(HomeKvServiceServer::new(homekv))
         .serve(server_addr)
-        .await?;
+        .await;
 
+    compact_task.abort();
+    let _ = compact_task.await;
+    let shutdown_result = store.shutdown().await;
+
+    grpc_result?;
+    shutdown_result?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use homekv::data_plane::{Request as CompactRequest, RequestBody, Status as CompactStatus};
+    use homekv::data_plane_runtime::RequestHandler;
+    use homekv::storage::shard_for_key;
+
+    #[tokio::test]
+    async fn grpc_and_compact_handlers_share_one_shard_store() {
+        let store = ShardStore::spawn(8);
+        let grpc = HomeKvServer::with_store(store.clone());
+        let compact = ShardRequestHandler::local(store.clone());
+        let key = "shared-protocol-key".to_string();
+        let value = b"shared-value".to_vec();
+
+        grpc.set(Request::new(SetRequest {
+            records: vec![Record {
+                key: key.clone(),
+                value: Some(value.clone()),
+            }],
+        }))
+        .await
+        .unwrap();
+
+        let compact_get = compact
+            .handle(CompactRequest {
+                request_id: 1,
+                shard_id: shard_for_key(key.as_bytes()).as_u16(),
+                body: RequestBody::Get {
+                    key: key.as_bytes().to_vec(),
+                },
+            })
+            .await;
+        assert_eq!(compact_get.status, CompactStatus::Ok);
+        assert_eq!(compact_get.body, value);
+
+        store.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn compact_runtime_bounds_reject_response_queue_larger_than_in_flight() {
+        let limits = RuntimeLimits {
+            max_in_flight: 4,
+            response_queue_capacity: 5,
+        };
+        assert!(limits.validate().is_err());
+    }
 }
