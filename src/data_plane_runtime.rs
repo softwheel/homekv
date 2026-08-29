@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 use std::fmt;
 use std::io;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, Semaphore};
@@ -41,6 +43,137 @@ impl RuntimeLimits {
             });
         }
         Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeMetricsSnapshot {
+    pub frames_accepted: u64,
+    pub frames_rejected: u64,
+    pub requests_accepted: u64,
+    pub requests_rejected: u64,
+    pub protocol_errors: u64,
+    pub malformed_errors: u64,
+    pub unsupported_version_errors: u64,
+    pub overload_responses: u64,
+    pub closed_responses: u64,
+    pub active_connections: usize,
+    pub peak_connections: usize,
+    pub in_flight_requests: usize,
+    pub peak_in_flight_requests: usize,
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+    pub completed_requests: u64,
+    pub handler_latency_ns_total: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct RuntimeMetrics {
+    frames_accepted: AtomicU64,
+    frames_rejected: AtomicU64,
+    requests_accepted: AtomicU64,
+    requests_rejected: AtomicU64,
+    protocol_errors: AtomicU64,
+    malformed_errors: AtomicU64,
+    unsupported_version_errors: AtomicU64,
+    overload_responses: AtomicU64,
+    closed_responses: AtomicU64,
+    active_connections: AtomicUsize,
+    peak_connections: AtomicUsize,
+    in_flight_requests: AtomicUsize,
+    peak_in_flight_requests: AtomicUsize,
+    bytes_read: AtomicU64,
+    bytes_written: AtomicU64,
+    completed_requests: AtomicU64,
+    handler_latency_ns_total: AtomicU64,
+}
+
+impl RuntimeMetrics {
+    pub fn snapshot(&self) -> RuntimeMetricsSnapshot {
+        RuntimeMetricsSnapshot {
+            frames_accepted: self.frames_accepted.load(Ordering::Relaxed),
+            frames_rejected: self.frames_rejected.load(Ordering::Relaxed),
+            requests_accepted: self.requests_accepted.load(Ordering::Relaxed),
+            requests_rejected: self.requests_rejected.load(Ordering::Relaxed),
+            protocol_errors: self.protocol_errors.load(Ordering::Relaxed),
+            malformed_errors: self.malformed_errors.load(Ordering::Relaxed),
+            unsupported_version_errors: self.unsupported_version_errors.load(Ordering::Relaxed),
+            overload_responses: self.overload_responses.load(Ordering::Relaxed),
+            closed_responses: self.closed_responses.load(Ordering::Relaxed),
+            active_connections: self.active_connections.load(Ordering::Relaxed),
+            peak_connections: self.peak_connections.load(Ordering::Relaxed),
+            in_flight_requests: self.in_flight_requests.load(Ordering::Relaxed),
+            peak_in_flight_requests: self.peak_in_flight_requests.load(Ordering::Relaxed),
+            bytes_read: self.bytes_read.load(Ordering::Relaxed),
+            bytes_written: self.bytes_written.load(Ordering::Relaxed),
+            completed_requests: self.completed_requests.load(Ordering::Relaxed),
+            handler_latency_ns_total: self.handler_latency_ns_total.load(Ordering::Relaxed),
+        }
+    }
+
+    fn connection_opened(&self) {
+        let current = self.active_connections.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak_connections.fetch_max(current, Ordering::Relaxed);
+    }
+
+    fn connection_closed(&self) {
+        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn request_started(&self) {
+        self.requests_accepted.fetch_add(1, Ordering::Relaxed);
+        let current = self.in_flight_requests.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak_in_flight_requests
+            .fetch_max(current, Ordering::Relaxed);
+    }
+
+    fn request_completed(&self, elapsed_ns: u64) {
+        self.in_flight_requests.fetch_sub(1, Ordering::Relaxed);
+        self.completed_requests.fetch_add(1, Ordering::Relaxed);
+        self.handler_latency_ns_total
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
+    fn protocol_error(&self, error: &CodecError) {
+        self.protocol_errors.fetch_add(1, Ordering::Relaxed);
+        match error {
+            CodecError::UnsupportedVersion(_) => {
+                self.unsupported_version_errors
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                self.malformed_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn record_response_status(&self, status: Status) {
+        match status {
+            Status::Overloaded => {
+                self.overload_responses.fetch_add(1, Ordering::Relaxed);
+            }
+            Status::ClosedOrUnavailable => {
+                self.closed_responses.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+}
+
+struct ConnectionGuard {
+    metrics: Arc<RuntimeMetrics>,
+}
+
+impl ConnectionGuard {
+    fn new(metrics: Arc<RuntimeMetrics>) -> Self {
+        metrics.connection_opened();
+        Self { metrics }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.metrics.connection_closed();
     }
 }
 
@@ -115,12 +248,37 @@ pub async fn serve_listener<H: RequestHandler>(
     codec_limits: CodecLimits,
     runtime_limits: RuntimeLimits,
 ) -> Result<(), RuntimeError> {
+    serve_listener_with_metrics(
+        listener,
+        handler,
+        codec_limits,
+        runtime_limits,
+        Arc::new(RuntimeMetrics::default()),
+    )
+    .await
+}
+
+pub async fn serve_listener_with_metrics<H: RequestHandler>(
+    listener: TcpListener,
+    handler: Arc<H>,
+    codec_limits: CodecLimits,
+    runtime_limits: RuntimeLimits,
+    metrics: Arc<RuntimeMetrics>,
+) -> Result<(), RuntimeError> {
     let runtime_limits = runtime_limits.validate()?;
     loop {
         let (stream, _) = listener.accept().await?;
         let handler = handler.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
-            let _ = serve_connection(stream, handler, codec_limits, runtime_limits).await;
+            let _ = serve_connection_with_metrics(
+                stream,
+                handler,
+                codec_limits,
+                runtime_limits,
+                metrics,
+            )
+            .await;
         });
     }
 }
@@ -131,7 +289,24 @@ pub async fn serve_connection<H: RequestHandler>(
     codec_limits: CodecLimits,
     runtime_limits: RuntimeLimits,
 ) -> Result<(), RuntimeError> {
-    serve_stream(stream, handler, codec_limits, runtime_limits).await
+    serve_connection_with_metrics(
+        stream,
+        handler,
+        codec_limits,
+        runtime_limits,
+        Arc::new(RuntimeMetrics::default()),
+    )
+    .await
+}
+
+pub async fn serve_connection_with_metrics<H: RequestHandler>(
+    stream: TcpStream,
+    handler: Arc<H>,
+    codec_limits: CodecLimits,
+    runtime_limits: RuntimeLimits,
+    metrics: Arc<RuntimeMetrics>,
+) -> Result<(), RuntimeError> {
+    serve_stream_with_metrics(stream, handler, codec_limits, runtime_limits, metrics).await
 }
 
 pub async fn serve_stream<S, H>(
@@ -144,7 +319,29 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: RequestHandler,
 {
+    serve_stream_with_metrics(
+        stream,
+        handler,
+        codec_limits,
+        runtime_limits,
+        Arc::new(RuntimeMetrics::default()),
+    )
+    .await
+}
+
+pub async fn serve_stream_with_metrics<S, H>(
+    stream: S,
+    handler: Arc<H>,
+    codec_limits: CodecLimits,
+    runtime_limits: RuntimeLimits,
+    metrics: Arc<RuntimeMetrics>,
+) -> Result<(), RuntimeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    H: RequestHandler,
+{
     let runtime_limits = runtime_limits.validate()?;
+    let _connection_guard = ConnectionGuard::new(metrics.clone());
     let semaphore = Arc::new(Semaphore::new(runtime_limits.max_in_flight));
     let active_request_ids = Arc::new(Mutex::new(HashSet::<u64>::with_capacity(
         runtime_limits.max_in_flight,
@@ -152,7 +349,8 @@ where
     let (response_tx, response_rx) =
         mpsc::channel::<Vec<u8>>(runtime_limits.response_queue_capacity);
     let (mut reader, writer) = tokio::io::split(stream);
-    let writer_task = tokio::spawn(write_responses(writer, response_rx));
+    let writer_metrics = metrics.clone();
+    let writer_task = tokio::spawn(write_responses(writer, response_rx, writer_metrics));
 
     let read_result = loop {
         // Acquire before advancing application reads. At saturation, no additional
@@ -162,7 +360,7 @@ where
             Err(_) => break Ok(()),
         };
 
-        let frame = match read_request_frame(&mut reader, codec_limits).await {
+        let frame = match read_request_frame(&mut reader, codec_limits, &metrics).await {
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 drop(permit);
@@ -170,20 +368,37 @@ where
             }
             Err(error) => {
                 drop(permit);
+                metrics.frames_rejected.fetch_add(1, Ordering::Relaxed);
+                if let RuntimeError::Codec(codec_error) = &error {
+                    metrics.protocol_error(codec_error);
+                } else if matches!(error, RuntimeError::UnexpectedFrameKind(_)) {
+                    metrics.protocol_errors.fetch_add(1, Ordering::Relaxed);
+                    metrics.malformed_errors.fetch_add(1, Ordering::Relaxed);
+                }
                 break Err(error);
             }
         };
 
         let request = match decode_request(&frame, codec_limits) {
-            Ok(request) => request,
+            Ok(request) => {
+                metrics.frames_accepted.fetch_add(1, Ordering::Relaxed);
+                request
+            }
             Err(error) => {
                 drop(permit);
+                metrics.frames_rejected.fetch_add(1, Ordering::Relaxed);
+                metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+                metrics.protocol_error(&error);
                 if let Some(request_id) = correlated_request_id(&frame) {
                     let response = Response {
                         request_id,
-                        status: Status::MalformedRequest,
+                        status: match error {
+                            CodecError::UnsupportedVersion(_) => Status::UnsupportedVersion,
+                            _ => Status::MalformedRequest,
+                        },
                         body: Vec::new(),
                     };
+                    metrics.record_response_status(response.status);
                     match encode_response(&response, codec_limits) {
                         Ok(encoded) => {
                             if response_tx.send(encoded).await.is_err() {
@@ -204,6 +419,7 @@ where
             if !active.insert(request_id) {
                 drop(active);
                 drop(permit);
+                metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
                 let duplicate = Response {
                     request_id,
                     status: Status::DuplicateInflightRequestId,
@@ -217,11 +433,15 @@ where
             }
         }
 
+        metrics.request_started();
         let handler = handler.clone();
         let response_tx = response_tx.clone();
         let active_request_ids = active_request_ids.clone();
+        let request_metrics = metrics.clone();
         tokio::spawn(async move {
+            let started = Instant::now();
             let handler_response = handler.handle(request).await;
+            request_metrics.record_response_status(handler_response.status);
             let response = Response {
                 request_id,
                 status: handler_response.status,
@@ -243,6 +463,8 @@ where
             }
 
             active_request_ids.lock().await.remove(&request_id);
+            let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            request_metrics.request_completed(elapsed_ns);
             drop(permit);
         });
     };
@@ -255,13 +477,15 @@ where
 async fn read_request_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     limits: CodecLimits,
+    metrics: &RuntimeMetrics,
 ) -> Result<Option<Vec<u8>>, RuntimeError> {
     let mut prefix = [0u8; FRAME_PREFIX_LEN];
     let first = reader.read(&mut prefix[..1]).await?;
     if first == 0 {
         return Ok(None);
     }
-    reader.read_exact(&mut prefix[1..]).await?;
+    metrics.bytes_read.fetch_add(first as u64, Ordering::Relaxed);
+    read_exact_counted(reader, &mut prefix[1..], metrics).await?;
     let decoded = decode_prefix(&prefix, limits)?;
     if decoded.kind != FrameKind::Request {
         return Err(RuntimeError::UnexpectedFrameKind(decoded.kind));
@@ -274,18 +498,60 @@ async fn read_request_frame<R: AsyncRead + Unpin>(
     let mut frame = Vec::with_capacity(total);
     frame.extend_from_slice(&prefix);
     frame.resize(total, 0);
-    reader.read_exact(&mut frame[FRAME_PREFIX_LEN..]).await?;
+    read_exact_counted(reader, &mut frame[FRAME_PREFIX_LEN..], metrics).await?;
     Ok(Some(frame))
+}
+
+async fn read_exact_counted<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    mut buffer: &mut [u8],
+    metrics: &RuntimeMetrics,
+) -> io::Result<()> {
+    while !buffer.is_empty() {
+        let read = reader.read(buffer).await?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "compact frame ended before declared length",
+            ));
+        }
+        metrics.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
+        let (_, remaining) = buffer.split_at_mut(read);
+        buffer = remaining;
+    }
+    Ok(())
 }
 
 async fn write_responses<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut responses: mpsc::Receiver<Vec<u8>>,
+    metrics: Arc<RuntimeMetrics>,
 ) -> io::Result<()> {
     while let Some(frame) = responses.recv().await {
-        writer.write_all(&frame).await?;
+        write_all_counted(&mut writer, &frame, &metrics).await?;
     }
     writer.shutdown().await
+}
+
+async fn write_all_counted<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    mut buffer: &[u8],
+    metrics: &RuntimeMetrics,
+) -> io::Result<()> {
+    while !buffer.is_empty() {
+        let written = writer.write(buffer).await?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write compact response",
+            ));
+        }
+        metrics
+            .bytes_written
+            .fetch_add(written as u64, Ordering::Relaxed);
+        buffer = &buffer[written..];
+    }
+    Ok(())
 }
 
 fn correlated_request_id(frame: &[u8]) -> Option<u64> {
@@ -300,7 +566,7 @@ fn correlated_request_id(frame: &[u8]) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::data_plane::{
-        decode_response, encode_request, Request, RequestBody, Status, FRAME_PREFIX_LEN,
+        decode_response, encode_request, Request, RequestBody, Status, FRAME_PREFIX_LEN, VERSION,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
@@ -314,6 +580,13 @@ mod tests {
             max_value: 2048,
             max_batch_mutations: 16,
             max_batch_payload: 3072,
+        }
+    }
+
+    fn runtime_limits() -> RuntimeLimits {
+        RuntimeLimits {
+            max_in_flight: 2,
+            response_queue_capacity: 2,
         }
     }
 
@@ -380,10 +653,7 @@ mod tests {
             listener,
             Arc::new(EchoHandler),
             test_codec_limits(),
-            RuntimeLimits {
-                max_in_flight: 2,
-                response_queue_capacity: 2,
-            },
+            runtime_limits(),
         ));
 
         let mut client = TcpStream::connect(address).await.unwrap();
@@ -423,10 +693,7 @@ mod tests {
             server,
             handler,
             test_codec_limits(),
-            RuntimeLimits {
-                max_in_flight: 2,
-                response_queue_capacity: 2,
-            },
+            runtime_limits(),
         ));
 
         write_request(&mut client, 1).await;
@@ -459,10 +726,7 @@ mod tests {
             server,
             handler,
             test_codec_limits(),
-            RuntimeLimits {
-                max_in_flight: 2,
-                response_queue_capacity: 2,
-            },
+            runtime_limits(),
         ));
 
         write_request(&mut client, 11).await;
@@ -585,9 +849,6 @@ mod tests {
 
     #[tokio::test]
     async fn slow_client_applies_bounded_response_backpressure() {
-        // Tiny duplex capacity makes the single writer block quickly when the client
-        // deliberately does not read responses. The bounded response queue then
-        // retains permits and prevents unbounded request execution.
         let (server, mut client) = duplex(64);
         let (started_tx, mut started_rx) = mpsc::channel(16);
         let server_task = tokio::spawn(serve_stream(
@@ -603,10 +864,6 @@ mod tests {
         for id in 41..=45 {
             write_request(&mut client, id).await;
         }
-
-        // Writer owns one response, the queue can hold one more, and at most two
-        // handlers may then be blocked trying to enqueue. The fifth request cannot
-        // be admitted until the client drains responses.
         for expected in 41..=44 {
             assert_eq!(started_rx.recv().await, Some(expected));
         }
@@ -620,5 +877,158 @@ mod tests {
         assert_eq!(started_rx.recv().await, Some(45));
         drop(client);
         let _ = timeout(Duration::from_secs(1), server_task).await;
+    }
+
+    struct StatusHandler;
+
+    #[async_trait]
+    impl RequestHandler for StatusHandler {
+        async fn handle(&self, request: Request) -> HandlerResponse {
+            match request.request_id {
+                71 => HandlerResponse::new(Status::Overloaded, Vec::new()),
+                72 => HandlerResponse::new(Status::ClosedOrUnavailable, Vec::new()),
+                _ => HandlerResponse::ok(Vec::new()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_cover_success_status_bytes_and_connection_lifecycle() {
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let (server, mut client) = duplex(16 * 1024);
+        let server_task = tokio::spawn(serve_stream_with_metrics(
+            server,
+            Arc::new(StatusHandler),
+            test_codec_limits(),
+            runtime_limits(),
+            metrics.clone(),
+        ));
+
+        for id in [70, 71, 72] {
+            write_request(&mut client, id).await;
+            let response = read_response(&mut client).await;
+            assert_eq!(response.request_id, id);
+        }
+        drop(client);
+        timeout(Duration::from_secs(1), server_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.frames_accepted, 3);
+        assert_eq!(snapshot.frames_rejected, 0);
+        assert_eq!(snapshot.requests_accepted, 3);
+        assert_eq!(snapshot.requests_rejected, 0);
+        assert_eq!(snapshot.overload_responses, 1);
+        assert_eq!(snapshot.closed_responses, 1);
+        assert_eq!(snapshot.active_connections, 0);
+        assert_eq!(snapshot.peak_connections, 1);
+        assert_eq!(snapshot.in_flight_requests, 0);
+        assert!(snapshot.peak_in_flight_requests >= 1);
+        assert_eq!(snapshot.completed_requests, 3);
+        assert!(snapshot.bytes_read > 0);
+        assert!(snapshot.bytes_written > 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_track_duplicate_request_rejection_and_peak_inflight() {
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let (server, mut client) = duplex(16 * 1024);
+        let (started_tx, mut started_rx) = mpsc::channel(8);
+        let release = Arc::new(Semaphore::new(0));
+        let handler = Arc::new(BlockingHandler {
+            started: started_tx,
+            release: release.clone(),
+        });
+        let server_task = tokio::spawn(serve_stream_with_metrics(
+            server,
+            handler,
+            test_codec_limits(),
+            runtime_limits(),
+            metrics.clone(),
+        ));
+
+        write_request(&mut client, 80).await;
+        write_request(&mut client, 81).await;
+        assert_eq!(started_rx.recv().await, Some(80));
+        assert_eq!(started_rx.recv().await, Some(81));
+        write_request(&mut client, 80).await;
+
+        release.add_permits(2);
+        for _ in 0..3 {
+            let _ = read_response(&mut client).await;
+        }
+        drop(client);
+        let _ = timeout(Duration::from_secs(1), server_task).await;
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.frames_accepted, 3);
+        assert_eq!(snapshot.requests_accepted, 2);
+        assert_eq!(snapshot.requests_rejected, 1);
+        assert_eq!(snapshot.peak_in_flight_requests, 2);
+        assert_eq!(snapshot.in_flight_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_track_correlated_malformed_request() {
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let (server, mut client) = duplex(4096);
+        let server_task = tokio::spawn(serve_stream_with_metrics(
+            server,
+            Arc::new(EchoHandler),
+            test_codec_limits(),
+            runtime_limits(),
+            metrics.clone(),
+        ));
+
+        let mut frame = encode_request(&request(90), test_codec_limits()).unwrap();
+        frame[FRAME_PREFIX_LEN + 10] = 0xff;
+        client.write_all(&frame).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert_eq!(response.request_id, 90);
+        assert_eq!(response.status, Status::MalformedRequest);
+        drop(client);
+        let _ = timeout(Duration::from_secs(1), server_task).await;
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.frames_accepted, 0);
+        assert_eq!(snapshot.frames_rejected, 1);
+        assert_eq!(snapshot.requests_rejected, 1);
+        assert_eq!(snapshot.protocol_errors, 1);
+        assert_eq!(snapshot.malformed_errors, 1);
+        assert_eq!(snapshot.unsupported_version_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_track_unsupported_version_and_partial_disconnect_bytes() {
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let (server, mut client) = duplex(4096);
+        let server_task = tokio::spawn(serve_stream_with_metrics(
+            server,
+            Arc::new(EchoHandler),
+            test_codec_limits(),
+            runtime_limits(),
+            metrics.clone(),
+        ));
+
+        let mut frame = encode_request(&request(91), test_codec_limits()).unwrap();
+        frame[2] = VERSION.wrapping_add(1);
+        client.write_all(&frame[..FRAME_PREFIX_LEN]).await.unwrap();
+        drop(client);
+        let result = timeout(Duration::from_secs(1), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(RuntimeError::Codec(CodecError::UnsupportedVersion(_)))));
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.frames_rejected, 1);
+        assert_eq!(snapshot.protocol_errors, 1);
+        assert_eq!(snapshot.unsupported_version_errors, 1);
+        assert_eq!(snapshot.malformed_errors, 0);
+        assert_eq!(snapshot.active_connections, 0);
+        assert_eq!(snapshot.bytes_read, FRAME_PREFIX_LEN as u64);
     }
 }
