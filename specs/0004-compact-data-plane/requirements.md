@@ -89,14 +89,24 @@ M2 excludes OpenRaft, WAL/snapshots, distributed placement/reconfiguration, leas
 
 ## 9. Performance and observability
 
-**REQ-M2-PERF-001** — The compact path SHOULD reduce healthy local request overhead relative to the existing gRPC path under equivalent M1 semantics; no fixed speedup is required for acceptance unless amended before verification.
+**REQ-M2-PERF-001** — The compact path SHOULD reduce healthy local request overhead relative to the existing gRPC path under equivalent M1 semantics; no fixed compact-vs-gRPC speedup is required for acceptance unless amended before verification.
 
 **REQ-M2-PERF-002** — Benchmark evidence MUST include GET/SET/DELETE and a mixed workload, at least 1 and 32 pipeline depth, p50/p95/p99, throughput, failures, payload sizes, and host/toolchain metadata.
 
 **REQ-M2-PERF-003** — Benchmark comparisons MUST use equivalent local consistency/durability semantics and MUST retain the existing gRPC path as the comparison point.
 
+**REQ-M2-PERF-004** — Before Spec 0004 may become Verified, the compact depth-32 path MUST NOT retain the repeatable transport cliff observed in M2-T6. On the frozen 16B-key/64B-value/50k-key local matrix, for every GET/SET/DELETE/80-20 workload the median compact depth-32 throughput across three complete runs MUST be at least the corresponding compact depth-1 throughput, with zero benchmark failures. This is a pipeline-health regression gate, not a public performance claim and not a license to weaken any bound, ordering, cancellation, consistency, or durability semantic.
+
+**REQ-M2-PERF-005** — Any transport tuning used to satisfy `REQ-M2-PERF-004` MUST be explicitly configured or deterministic, exercised on both accepted server and benchmark-client paths as applicable, and verified not to bypass per-connection in-flight limits, bounded response buffering, shard backpressure, or admitted-work cancellation semantics.
+
 **REQ-M2-OPS-001** — The server MUST expose counters/gauges sufficient to observe accepted/rejected frames, active connections, in-flight requests, protocol errors, overload responses, and bytes read/written.
 
 ## 10. Acceptance
 
-Spec 0004 may become Verified only when the implementation and tests establish all mandatory protocol, bound, pipelining, routing, backpressure, compatibility, and observability requirements and retain reproducible benchmark evidence. Passing M2 MUST NOT be interpreted as proving distributed linearizability or durable replicated writes; those belong to M3+.
+Spec 0004 may become Verified only when the implementation and tests establish all mandatory protocol, bound, pipelining, routing, backpressure, compatibility, observability, and pipeline-health requirements and retain reproducible benchmark evidence. Passing M2 MUST NOT be interpreted as proving distributed linearizability or durable replicated writes; those belong to M3+.
+
+## 11. Accepted amendment — depth-32 pipeline cliff
+
+M2-T6 retained a repeatable compact depth-32 result of roughly 40.9 ms p50 / 779 ops/s while compact depth 1 sustained roughly 11.2k ops/s and gRPC depth 32 sustained roughly 20–22k ops/s. Because this contradicts the intended healthy pipelined data-plane behavior, verification is intentionally blocked until the cause is diagnosed and corrected under `REQ-M2-PERF-004/005`.
+
+The approximately 40 ms signature is consistent with a small-write TCP delayed-ACK/Nagle interaction, and the current compact benchmark/server paths do not explicitly configure `TCP_NODELAY`; this is a hypothesis to test, not an implementation mandate. A fix MUST remain bounded to transport/pipeline mechanics and MUST NOT weaken the verified M1 semantics or M2 resource bounds.
