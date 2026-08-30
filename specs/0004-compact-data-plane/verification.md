@@ -16,6 +16,7 @@
 | REQ-M2-BP-001..004 | saturated shard, slow reader/writer, queue bound and disconnect tests |
 | REQ-M2-COMPAT-001..003 | gRPC regression suite plus adapter/source review |
 | REQ-M2-PERF-001..003 | repeated compact-vs-gRPC benchmark under equivalent M1 semantics |
+| REQ-M2-PERF-004/005 | before/after depth-32 pipeline diagnosis plus three-run compact pipeline-health gate |
 | REQ-M2-OPS-001 | metric state-transition tests |
 
 ## V1 — Wire compatibility
@@ -106,6 +107,19 @@ Primary cells:
 
 Report median and run spread. Do not select only the fastest repetition. Any claimed speedup must compare equivalent M1 local semantics and must be labeled as a local data-plane engineering result, not durable replicated performance.
 
+## V9 — Depth-32 pipeline health
+
+M2-T6 established a repeatable compact depth-32 cliff (~40.9 ms p50 / ~779 ops/s) that is incompatible with calling the compact path healthy under pipelining. Before verification:
+
+- preserve the original T6 artifact and measurements unchanged as the before-state;
+- classify the stall using bounded diagnostics; the ~40 ms shape and lack of explicit `TCP_NODELAY` make delayed-ACK/Nagle interaction a leading hypothesis, not a pre-decided fix;
+- prove any correction does not bypass the in-flight semaphore, active request-ID tracking, bounded response channel, shard admission/backpressure, or M1 cancellation/order semantics;
+- capture three complete post-fix repetitions from one exact commit with the same frozen T6 matrix;
+- require zero benchmark failures;
+- for GET, SET, DELETE and 80/20 independently, require median compact depth-32 throughput >= median compact depth-1 throughput.
+
+This gate establishes that request pipelining is not pathologically serialized by transport mechanics. It is not a public speed claim and does not require compact to beat gRPC at depth 32.
+
 ## M2 acceptance checklist
 
 Spec 0004 becomes Verified only when all mandatory items are checked:
@@ -121,7 +135,8 @@ Spec 0004 becomes Verified only when all mandatory items are checked:
 - [ ] explicit overload/closed/routing/protocol statuses verified
 - [ ] existing gRPC compatibility path remains green
 - [ ] protocol metrics verified
-- [ ] 3-run compact-vs-gRPC benchmark evidence retained
+- [ ] original 3-run compact-vs-gRPC benchmark evidence retained
+- [ ] depth-32 pipeline-health regression gate passes on 3 post-fix runs
 - [ ] no OpenRaft/WAL/Multi-Raft/lease-read code mixed into M2
 
 Only after this verification PR merges may #27 close and M3 become unblocked.
