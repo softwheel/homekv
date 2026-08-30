@@ -75,7 +75,7 @@ Prerequisite: M2-T2/T3.
 
 ## M2-T6 — Repeated comparative benchmark
 
-Requirements: `REQ-M2-PERF-*`
+Requirements: `REQ-M2-PERF-001/002/003`
 
 - compact client benchmark harness
 - equivalent gRPC comparison path
@@ -89,13 +89,30 @@ Completion: reproducible comparative evidence exists; conclusions explicitly sta
 
 Prerequisite: M2-T4/T5.
 
+## M2-T6A — Diagnose and correct compact depth-32 transport cliff
+
+Requirements: `REQ-M2-PERF-004/005`, plus preservation of `REQ-M2-BOUND-004`, `REQ-M2-PIPE-*`, and `REQ-M2-BP-*`
+
+- reproduce the retained T6 depth-32 cliff with exact benchmark semantics before changing transport behavior
+- instrument or otherwise isolate client write/read, server read/admission/handler, and response-write timing sufficiently to classify the stall
+- test the leading TCP small-write delayed-ACK/Nagle hypothesis, including explicit `TCP_NODELAY` configuration where appropriate, without assuming it is the root cause
+- apply only the smallest transport/pipeline correction supported by evidence
+- keep per-connection in-flight admission, active request-ID bounds, bounded response buffering, shard `QueueFull`/`Closed` propagation, same-shard ordering, and accepted-work cancellation semantics unchanged
+- add deterministic regression coverage for the chosen transport behavior where practical
+- rerun three complete comparative benchmark repetitions on one exact commit
+
+Completion: all Rust/M0 regression gates remain green, zero benchmark failures are retained, and for each frozen workload the median compact depth-32 throughput is at least its compact depth-1 throughput. Record before/after evidence and root-cause confidence without converting local engineering measurements into public release claims.
+
+Prerequisite: M2-T6 and this amendment merged in Accepted state.
+
 ## M2-T7 — Verification handoff
 
 - execute `verification.md` matrix
 - record exact commits, CI/workflow runs and benchmark artifacts
 - document compatibility surface (magic/version/op/status values)
 - separate correctness evidence from performance observations
+- include the M2-T6A root-cause/fix evidence and pipeline-health gate result
 - move Spec 0004 to Verified only when every mandatory gate passes
 - close #27 and unblock M3 only after verification merge
 
-Prerequisite: M2-T1..T6.
+Prerequisite: M2-T1..T6A.
