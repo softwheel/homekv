@@ -289,7 +289,7 @@ mod tests {
         let view = sm.view().await;
         assert_eq!(view.data, before);
         assert_eq!(view.last_applied, Some(log_id(2)));
-        assert_eq!(view.membership.log_id(), Some(log_id(2)));
+        assert_eq!(view.membership.log_id(), &Some(log_id(2)));
     }
 
     #[tokio::test]
