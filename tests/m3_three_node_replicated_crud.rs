@@ -3,7 +3,9 @@ use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use homekv::raft::{HomeKvRaftConfig, HomeKvStateMachine, RaftCommand, RaftMutation, RaftNode, RaftResponse};
+use homekv::raft::{
+    HomeKvRaftConfig, HomeKvStateMachine, RaftCommand, RaftMutation, RaftNode, RaftResponse,
+};
 use homekv::raft_network::HomeKvRaftNetworkFactory;
 use homekv::raft_storage::HomeKvRaftLogStore;
 use homekv::raft_transport::{BootstrapNode, TestLinkController, ThreeNodeBootstrap};
@@ -14,9 +16,18 @@ fn bootstrap() -> ThreeNodeBootstrap {
     ThreeNodeBootstrap::new(
         "homekv-m3-replicated-crud",
         [
-            BootstrapNode { id: 1, raft_endpoint: "127.0.0.1:19301".into() },
-            BootstrapNode { id: 2, raft_endpoint: "127.0.0.1:19302".into() },
-            BootstrapNode { id: 3, raft_endpoint: "127.0.0.1:19303".into() },
+            BootstrapNode {
+                id: 1,
+                raft_endpoint: "127.0.0.1:19301".into(),
+            },
+            BootstrapNode {
+                id: 2,
+                raft_endpoint: "127.0.0.1:19302".into(),
+            },
+            BootstrapNode {
+                id: 3,
+                raft_endpoint: "127.0.0.1:19303".into(),
+            },
         ],
     )
     .unwrap()
@@ -35,7 +46,10 @@ fn unique_test_dir() -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("homekv-m3-replicated-crud-{}-{nonce}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "homekv-m3-replicated-crud-{}-{nonce}",
+        std::process::id()
+    ))
 }
 
 struct Cluster {
@@ -89,12 +103,18 @@ impl Cluster {
 
         for factory in factories.values() {
             for (id, raft) in &nodes {
-                factory.register_handler(*id, Arc::new(raft.clone())).unwrap();
+                factory
+                    .register_handler(*id, Arc::new(raft.clone()))
+                    .unwrap();
             }
         }
         nodes.get(&1).unwrap().initialize(membership()).await.unwrap();
 
-        Self { root, nodes, state_machines }
+        Self {
+            root,
+            nodes,
+            state_machines,
+        }
     }
 
     async fn leader(&self) -> u64 {
@@ -138,46 +158,53 @@ async fn leader_client_write_replicates_set_delete_and_batch_to_all_voters() {
     let raft = cluster.nodes.get(&leader).unwrap();
 
     let set = raft
-        .client_write(RaftCommand::Set { key: b"a".to_vec(), value: b"one".to_vec() })
+        .client_write(RaftCommand::Set {
+            key: b"a".to_vec(),
+            value: b"one".to_vec(),
+        })
         .await
         .unwrap();
     assert_eq!(set.data, RaftResponse::Applied { mutations: 1 });
 
     let batch = raft
-        .client_write(RaftCommand::Batch { mutations: vec![
-            RaftMutation::Set { key: b"b".to_vec(), value: b"two".to_vec() },
-            RaftMutation::Delete { key: b"a".to_vec() },
-        ]})
+        .client_write(RaftCommand::Batch {
+            mutations: vec![
+                RaftMutation::Set {
+                    key: b"b".to_vec(),
+                    value: b"two".to_vec(),
+                },
+                RaftMutation::Delete { key: b"a".to_vec() },
+            ],
+        })
         .await
         .unwrap();
     assert_eq!(batch.data, RaftResponse::Applied { mutations: 2 });
 
     let delete = raft
-        .client_write(RaftCommand::Delete { key: b"missing".to_vec() })
+        .client_write(RaftCommand::Delete {
+            key: b"missing".to_vec(),
+        })
         .await
         .unwrap();
     assert_eq!(delete.data, RaftResponse::Applied { mutations: 1 });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let converged = cluster.state_machines.values().all(|sm| {
-            let _ = sm;
-            true
-        });
-        if converged {
-            let mut all_match = true;
-            for sm in cluster.state_machines.values() {
-                if sm.get(b"a").await.is_some() || sm.get(b"b").await != Some(b"two".to_vec()) {
-                    all_match = false;
-                    break;
-                }
-            }
-            if all_match {
+        let mut all_match = true;
+        for sm in cluster.state_machines.values() {
+            if sm.get(b"a").await.is_some() || sm.get(b"b").await != Some(b"two".to_vec()) {
+                all_match = false;
                 break;
             }
         }
+        if all_match {
+            break;
+        }
         if tokio::time::Instant::now() >= deadline {
-            let views = futures::future::join_all(cluster.state_machines.iter().map(|(id, sm)| async move { (*id, sm.view().await) })).await;
+            let mut views = Vec::new();
+            for (id, sm) in &cluster.state_machines {
+                views.push((*id, sm.view().await));
+            }
             panic!("replicated state did not converge: {views:?}");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -193,22 +220,53 @@ async fn strong_get_barrier_is_leader_authoritative_and_observes_applied_write()
     let leader_raft = cluster.nodes.get(&leader).unwrap();
 
     leader_raft
-        .client_write(RaftCommand::Set { key: b"k".to_vec(), value: b"v".to_vec() })
+        .client_write(RaftCommand::Set {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        })
         .await
         .unwrap();
     leader_raft.ensure_linearizable().await.unwrap();
-    assert_eq!(cluster.state_machines.get(&leader).unwrap().get(b"k").await, Some(b"v".to_vec()));
+    assert_eq!(
+        cluster
+            .state_machines
+            .get(&leader)
+            .unwrap()
+            .get(b"k")
+            .await,
+        Some(b"v".to_vec())
+    );
 
-    let follower = [1_u64, 2, 3].into_iter().find(|id| *id != leader).unwrap();
-    assert!(cluster.nodes.get(&follower).unwrap().ensure_linearizable().await.is_err());
+    let follower = [1_u64, 2, 3]
+        .into_iter()
+        .find(|id| *id != leader)
+        .unwrap();
     assert!(cluster
         .nodes
         .get(&follower)
         .unwrap()
-        .client_write(RaftCommand::Set { key: b"forbidden".to_vec(), value: b"local".to_vec() })
+        .ensure_linearizable()
         .await
         .is_err());
-    assert_eq!(cluster.state_machines.get(&follower).unwrap().get(b"forbidden").await, None);
+    assert!(cluster
+        .nodes
+        .get(&follower)
+        .unwrap()
+        .client_write(RaftCommand::Set {
+            key: b"forbidden".to_vec(),
+            value: b"local".to_vec(),
+        })
+        .await
+        .is_err());
+    assert_eq!(
+        cluster
+            .state_machines
+            .get(&follower)
+            .unwrap()
+            .get(b"forbidden")
+            .await,
+        None
+    );
 
     cluster.stop().await;
 }
