@@ -5,4 +5,5 @@ pub mod data_plane_adapter;
 pub mod data_plane_runtime;
 pub mod honey_bees;
 pub mod raft;
+pub mod raft_storage;
 pub mod storage;
