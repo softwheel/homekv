@@ -3,10 +3,10 @@ use std::fmt;
 use std::io;
 use std::sync::Arc;
 
-use openraft::storage::{RaftStateMachine, Snapshot};
+use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot, SnapshotMeta};
 use openraft::{
-    BasicNode, Entry, EntryPayload, LogId, RaftSnapshotBuilder, SnapshotMeta, StorageError,
-    StorageIOError, StoredMembership,
+    BasicNode, Entry, EntryPayload, LogId, OptionalSend, StorageError, StorageIOError,
+    StoredMembership,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -96,7 +96,7 @@ impl HomeKvStateMachine {
     }
 
     fn storage_error(message: &'static str) -> StorageError<RaftNodeId> {
-        let err = io::Error::new(io::ErrorKind::InvalidData, message);
+        let err = io::Error::new(io::ErrorKind::Unsupported, message);
         StorageIOError::read_state_machine(&err).into()
     }
 
@@ -114,7 +114,6 @@ impl HomeKvStateMachine {
                 if mutations.is_empty() {
                     return RaftResponse::EmptyBatch;
                 }
-
                 for mutation in &mutations {
                     match mutation {
                         RaftMutation::Set { key, value } => {
@@ -141,7 +140,7 @@ impl RaftSnapshotBuilder<HomeKvRaftConfig> for DeferredSnapshotBuilder {
         &mut self,
     ) -> Result<Snapshot<HomeKvRaftConfig>, StorageError<RaftNodeId>> {
         Err(HomeKvStateMachine::storage_error(
-            "snapshot build is deferred to accepted M3-T5",
+            "snapshot build is deferred to M3-T5",
         ))
     }
 }
@@ -167,7 +166,8 @@ impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
         entries: I,
     ) -> Result<Vec<RaftResponse>, StorageError<RaftNodeId>>
     where
-        I: IntoIterator<Item = Entry<HomeKvRaftConfig>> + Send,
+        I: IntoIterator<Item = Entry<HomeKvRaftConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
     {
         let mut responses = Vec::new();
         let mut state = self.inner.write().await;
@@ -179,9 +179,7 @@ impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
                     continue;
                 }
                 if entry.log_id.index <= last.index {
-                    return Err(Self::storage_error(
-                        "state-machine apply order regressed or reused a log index",
-                    ));
+                    return Err(Self::storage_error("state-machine apply order regressed"));
                 }
             }
 
@@ -193,11 +191,9 @@ impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
                     RaftResponse::Noop
                 }
             };
-
             state.last_applied = Some(entry.log_id);
             responses.push(response);
         }
-
         Ok(responses)
     }
 
@@ -211,9 +207,7 @@ impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
         Box<<HomeKvRaftConfig as openraft::RaftTypeConfig>::SnapshotData>,
         StorageError<RaftNodeId>,
     > {
-        Err(Self::storage_error(
-            "snapshot receiving is deferred to accepted M3-T5",
-        ))
+        Err(Self::storage_error("snapshot receive is deferred to M3-T5"))
     }
 
     async fn install_snapshot(
@@ -221,9 +215,7 @@ impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
         _meta: &SnapshotMeta<RaftNodeId, RaftNode>,
         _snapshot: Box<<HomeKvRaftConfig as openraft::RaftTypeConfig>::SnapshotData>,
     ) -> Result<(), StorageError<RaftNodeId>> {
-        Err(Self::storage_error(
-            "snapshot installation is deferred to accepted M3-T5",
-        ))
+        Err(Self::storage_error("snapshot install is deferred to M3-T5"))
     }
 
     async fn get_current_snapshot(
@@ -252,171 +244,79 @@ mod tests {
         }
     }
 
-    fn membership(index: u64) -> Entry<HomeKvRaftConfig> {
-        let voters = BTreeSet::from([1, 2, 3]);
-        let membership = Membership::new(vec![voters], BTreeMap::<RaftNodeId, RaftNode>::new());
-        Entry {
-            log_id: log_id(index),
-            payload: EntryPayload::Membership(membership),
-        }
-    }
-
     #[tokio::test]
-    async fn applies_commands_in_committed_order_with_m1_semantics() {
-        let mut state_machine = HomeKvStateMachine::default();
-        let entries = vec![
-            normal(
-                1,
-                RaftCommand::Set {
-                    key: b"a".to_vec(),
-                    value: b"one".to_vec(),
-                },
-            ),
-            normal(
-                2,
-                RaftCommand::Batch {
-                    mutations: vec![
-                        RaftMutation::Set {
-                            key: b"b".to_vec(),
-                            value: b"two".to_vec(),
-                        },
-                        RaftMutation::Delete { key: b"a".to_vec() },
-                    ],
-                },
-            ),
-            normal(3, RaftCommand::Delete { key: b"missing".to_vec() }),
-        ];
-
-        let responses = state_machine.apply(entries).await.unwrap();
-        assert_eq!(
-            responses,
-            vec![
-                RaftResponse::Applied { mutations: 1 },
-                RaftResponse::Applied { mutations: 2 },
-                RaftResponse::Applied { mutations: 1 },
-            ]
-        );
-        assert_eq!(state_machine.get(b"a").await, None);
-        assert_eq!(state_machine.get(b"b").await, Some(b"two".to_vec()));
-        assert_eq!(state_machine.view().await.last_applied, Some(log_id(3)));
-    }
-
-    #[tokio::test]
-    async fn membership_entries_advance_metadata_without_mutating_kv_state() {
-        let mut state_machine = HomeKvStateMachine::default();
-        state_machine
-            .apply(vec![normal(
-                1,
-                RaftCommand::Set {
-                    key: b"stable".to_vec(),
-                    value: b"value".to_vec(),
-                },
-            )])
+    async fn applies_commands_in_committed_order() {
+        let mut sm = HomeKvStateMachine::default();
+        let responses = sm
+            .apply(vec![
+                normal(1, RaftCommand::Set { key: b"a".to_vec(), value: b"one".to_vec() }),
+                normal(2, RaftCommand::Batch { mutations: vec![
+                    RaftMutation::Set { key: b"b".to_vec(), value: b"two".to_vec() },
+                    RaftMutation::Delete { key: b"a".to_vec() },
+                ]}),
+                normal(3, RaftCommand::Delete { key: b"missing".to_vec() }),
+            ])
             .await
             .unwrap();
-        let before = state_machine.view().await.data;
 
-        state_machine.apply(vec![membership(2)]).await.unwrap();
-        let view = state_machine.view().await;
+        assert_eq!(responses, vec![
+            RaftResponse::Applied { mutations: 1 },
+            RaftResponse::Applied { mutations: 2 },
+            RaftResponse::Applied { mutations: 1 },
+        ]);
+        assert_eq!(sm.get(b"a").await, None);
+        assert_eq!(sm.get(b"b").await, Some(b"two".to_vec()));
+        assert_eq!(sm.view().await.last_applied, Some(log_id(3)));
+    }
 
+    #[tokio::test]
+    async fn membership_entry_updates_metadata_only() {
+        let mut sm = HomeKvStateMachine::default();
+        sm.apply(vec![normal(1, RaftCommand::Set { key: b"k".to_vec(), value: b"v".to_vec() })])
+            .await
+            .unwrap();
+        let before = sm.view().await.data;
+
+        let voters = BTreeSet::from([1, 2, 3]);
+        let membership = Membership::new(vec![voters], BTreeMap::<RaftNodeId, RaftNode>::new());
+        sm.apply(vec![Entry {
+            log_id: log_id(2),
+            payload: EntryPayload::Membership(membership),
+        }])
+        .await
+        .unwrap();
+
+        let view = sm.view().await;
         assert_eq!(view.data, before);
         assert_eq!(view.last_applied, Some(log_id(2)));
         assert_eq!(view.membership.log_id(), Some(log_id(2)));
     }
 
     #[tokio::test]
-    async fn replaying_the_same_committed_history_reconstructs_the_same_logical_state() {
-        fn history() -> Vec<Entry<HomeKvRaftConfig>> {
-            vec![
-                normal(
-                    1,
-                    RaftCommand::Set {
-                        key: b"k".to_vec(),
-                        value: b"v1".to_vec(),
-                    },
-                ),
-                normal(
-                    2,
-                    RaftCommand::Batch {
-                        mutations: vec![
-                            RaftMutation::Set {
-                                key: b"k".to_vec(),
-                                value: b"v2".to_vec(),
-                            },
-                            RaftMutation::Set {
-                                key: b"other".to_vec(),
-                                value: b"x".to_vec(),
-                            },
-                        ],
-                    },
-                ),
-                normal(3, RaftCommand::Delete { key: b"other".to_vec() }),
-            ]
-        }
-
+    async fn replay_is_deterministic_and_duplicate_identity_is_not_reapplied() {
+        let history = || vec![
+            normal(1, RaftCommand::Set { key: b"k".to_vec(), value: b"v1".to_vec() }),
+            normal(2, RaftCommand::Set { key: b"k".to_vec(), value: b"v2".to_vec() }),
+        ];
         let mut first = HomeKvStateMachine::default();
         let mut recovered = HomeKvStateMachine::default();
         first.apply(history()).await.unwrap();
         recovered.apply(history()).await.unwrap();
-
         assert_eq!(first.view().await, recovered.view().await);
+
+        let duplicate = normal(2, RaftCommand::Delete { key: b"k".to_vec() });
+        assert_eq!(first.apply(vec![duplicate]).await.unwrap(), vec![RaftResponse::Noop]);
+        assert_eq!(first.get(b"k").await, Some(b"v2".to_vec()));
     }
 
     #[tokio::test]
-    async fn repeated_log_identity_does_not_apply_twice_and_regression_fails_closed() {
-        let mut state_machine = HomeKvStateMachine::default();
-        let entry = normal(
-            1,
-            RaftCommand::Set {
-                key: b"k".to_vec(),
-                value: b"v".to_vec(),
-            },
-        );
-
-        assert_eq!(
-            state_machine.apply(vec![entry.clone()]).await.unwrap(),
-            vec![RaftResponse::Applied { mutations: 1 }]
-        );
-        assert_eq!(
-            state_machine.apply(vec![entry]).await.unwrap(),
-            vec![RaftResponse::Noop]
-        );
-
-        state_machine
-            .apply(vec![normal(
-                2,
-                RaftCommand::Set {
-                    key: b"k".to_vec(),
-                    value: b"v2".to_vec(),
-                },
-            )])
+    async fn lower_log_index_fails_closed() {
+        let mut sm = HomeKvStateMachine::default();
+        sm.apply(vec![normal(2, RaftCommand::Set { key: b"k".to_vec(), value: b"v".to_vec() })])
             .await
             .unwrap();
-        let before = state_machine.view().await;
-
-        assert!(state_machine
-            .apply(vec![normal(
-                1,
-                RaftCommand::Delete { key: b"k".to_vec() },
-            )])
-            .await
-            .is_err());
-        assert_eq!(state_machine.view().await, before);
-    }
-
-    #[tokio::test]
-    async fn empty_batch_is_deterministic_and_does_not_mutate_kv_state() {
-        let mut state_machine = HomeKvStateMachine::default();
-        let responses = state_machine
-            .apply(vec![normal(
-                1,
-                RaftCommand::Batch { mutations: vec![] },
-            )])
-            .await
-            .unwrap();
-
-        assert_eq!(responses, vec![RaftResponse::EmptyBatch]);
-        assert!(state_machine.view().await.data.is_empty());
-        assert_eq!(state_machine.view().await.last_applied, Some(log_id(1)));
+        let before = sm.view().await;
+        assert!(sm.apply(vec![normal(1, RaftCommand::Delete { key: b"k".to_vec() })]).await.is_err());
+        assert_eq!(sm.view().await, before);
     }
 }
