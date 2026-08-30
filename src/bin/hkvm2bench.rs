@@ -366,6 +366,9 @@ async fn run_compact_case(
     let mut stream = TcpStream::connect(&config.compact_endpoint)
         .await
         .with_context(|| format!("failed to connect to {}", config.compact_endpoint))?;
+    stream
+        .set_nodelay(true)
+        .context("failed to enable TCP_NODELAY for compact benchmark connection")?;
     let limits = CodecLimits::default();
     let mut request_id = 1u64;
     run_compact_operations(
@@ -408,7 +411,7 @@ async fn run_compact_case(
         elapsed.as_nanos().min(u64::MAX as u128) as u64,
         config.compact_endpoint.clone(),
         environment,
-        "compact uses one TCP connection with true request pipelining and request-id response correlation",
+        "compact uses one TCP_NODELAY connection with true request pipelining and request-id response correlation",
     ))
 }
 
