@@ -268,6 +268,7 @@ pub async fn serve_listener_with_metrics<H: RequestHandler>(
     let runtime_limits = runtime_limits.validate()?;
     loop {
         let (stream, _) = listener.accept().await?;
+        stream.set_nodelay(true)?;
         let handler = handler.clone();
         let metrics = metrics.clone();
         tokio::spawn(async move {
