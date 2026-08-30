@@ -412,7 +412,8 @@ impl RaftLogStorage<HomeKvRaftConfig> for HomeKvRaftLogStore {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use openraft::{CommittedLeaderId, EntryPayload, RaftLogReader, RaftLogStorage};
+    use openraft::storage::RaftLogStorage;
+    use openraft::{CommittedLeaderId, EntryPayload, RaftLogReader};
 
     use super::*;
     use crate::raft::RaftCommand;
