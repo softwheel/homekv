@@ -8,7 +8,7 @@ use openraft::{
     BasicNode, Entry, EntryPayload, LogId, OptionalSend, StorageError, StorageIOError,
     StoredMembership,
 };
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 pub type RaftNodeId = u64;
