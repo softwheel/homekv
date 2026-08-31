@@ -9,7 +9,7 @@ use homekv::raft::{HomeKvRaftConfig, HomeKvStateMachine, RaftNode};
 use homekv::raft_data_plane::ReplicatedShardRequestHandler;
 use homekv::raft_network::HomeKvRaftNetworkFactory;
 use homekv::raft_storage::HomeKvRaftLogStore;
-use homekv::raft_transport::{BootstrapNode, TestLinkController, ThreeNodeBootstrap};
+use homekv::raft_transport::{BootstrapNode, LinkRule, TestLinkController, ThreeNodeBootstrap};
 use homekv::storage::shard_for_key;
 use openraft::raft::Raft;
 use openraft::{Config, ServerState};
@@ -49,6 +49,7 @@ struct Cluster {
     root: std::path::PathBuf,
     nodes: BTreeMap<u64, Raft<HomeKvRaftConfig>>,
     state_machines: BTreeMap<u64, HomeKvStateMachine>,
+    links: TestLinkController,
 }
 
 impl Cluster {
@@ -106,6 +107,7 @@ impl Cluster {
             root,
             nodes,
             state_machines,
+            links,
         }
     }
 
@@ -228,6 +230,73 @@ async fn compact_contract_routes_strong_operations_through_raft_authority() {
         .await;
     assert_eq!(final_get.status, Status::Ok);
     assert_eq!(final_get.body, b"value");
+
+    cluster.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admitted_write_survives_transport_future_cancellation() {
+    let cluster = Cluster::start().await;
+    let leader = cluster.leader().await;
+    let key = b"cancelled-client-key".to_vec();
+    let shard = shard_for_key(&key).as_u16();
+    let handler = ReplicatedShardRequestHandler::new(
+        cluster.nodes.get(&leader).unwrap().clone(),
+        cluster.state_machines.get(&leader).unwrap().clone(),
+        shard,
+        8,
+    );
+
+    // Hold replication long enough to cancel the caller after admission but before quorum
+    // completion. The handler's detached consensus task must retain both the command and its
+    // bounded admission permit after the transport-facing future disappears.
+    for peer in [1_u64, 2, 3].into_iter().filter(|id| *id != leader) {
+        cluster
+            .links
+            .set_rule(leader, peer, LinkRule::Delay(Duration::from_millis(75)));
+    }
+
+    let write_handler = handler.clone();
+    let write_key = key.clone();
+    let transport = tokio::spawn(async move {
+        write_handler
+            .handle(request(
+                10,
+                shard,
+                RequestBody::Set {
+                    key: write_key,
+                    value: b"committed-after-cancel".to_vec(),
+                },
+            ))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    transport.abort();
+    assert!(transport.await.unwrap_err().is_cancelled());
+
+    for peer in [1_u64, 2, 3].into_iter().filter(|id| *id != leader) {
+        cluster.links.heal(leader, peer);
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if cluster.state_machines.get(&leader).unwrap().get(&key).await
+            == Some(b"committed-after-cancel".to_vec())
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "admitted write was revoked when the transport future was cancelled"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let read = handler
+        .handle(request(11, shard, RequestBody::Get { key }))
+        .await;
+    assert_eq!(read.status, Status::Ok);
+    assert_eq!(read.body, b"committed-after-cancel");
 
     cluster.stop().await;
 }
