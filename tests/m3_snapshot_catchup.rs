@@ -35,13 +35,14 @@ fn membership() -> BTreeMap<u64, RaftNode> {
     ])
 }
 
-fn config() -> Arc<Config> {
+fn config(elections: bool) -> Arc<Config> {
     Arc::new(
         Config {
             cluster_name: "homekv-m3-snapshot-catchup".into(),
             heartbeat_interval: 25,
             election_timeout_min: 100,
             election_timeout_max: 200,
+            enable_elect: elections,
             snapshot_policy: SnapshotPolicy::Never,
             snapshot_max_chunk_size: 64,
             max_in_snapshot_log_to_keep: 0,
@@ -93,7 +94,6 @@ async fn wait_for_state(sm: &HomeKvStateMachine, expected: &StateMachineView, ph
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lagging_follower_requires_snapshot_then_replays_subsequent_log() {
     let root = unique_test_dir("forced-snapshot-catchup");
-    let config = config();
     let links = TestLinkController::default();
     let mut factories = BTreeMap::new();
     let mut nodes = BTreeMap::new();
@@ -111,7 +111,7 @@ async fn lagging_follower_requires_snapshot_then_replays_subsequent_log() {
             "node startup",
             Raft::new(
                 id,
-                config.clone(),
+                config(id != 3),
                 factory.clone(),
                 store.clone(),
                 sm.clone(),
@@ -148,7 +148,8 @@ async fn lagging_follower_requires_snapshot_then_replays_subsequent_log() {
         wait_for_state(sm, &seeded, "seed replication").await;
     }
 
-    let lagging = (1..=3).find(|id| *id != leader).unwrap();
+    let lagging = 3;
+    assert_ne!(leader, lagging, "the non-campaigning replica must remain a follower");
     for peer in 1..=3 {
         if peer != lagging {
             links.partition_bidirectional(lagging, peer);
