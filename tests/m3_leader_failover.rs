@@ -10,7 +10,8 @@ use homekv::raft_network::HomeKvRaftNetworkFactory;
 use homekv::raft_storage::HomeKvRaftLogStore;
 use homekv::raft_transport::{BootstrapNode, TestLinkController, ThreeNodeBootstrap};
 use openraft::raft::Raft;
-use openraft::Config;
+use openraft::storage::RaftLogStorage;
+use openraft::{Config, EntryPayload, RaftLogReader};
 
 fn bootstrap() -> ThreeNodeBootstrap {
     ThreeNodeBootstrap::new(
@@ -77,6 +78,7 @@ async fn healthy_quorum_elects_new_leader_and_preserves_acknowledged_state() {
         );
     }
     let mut nodes = BTreeMap::new();
+    let mut stores = BTreeMap::new();
     let mut state_machines = BTreeMap::new();
     for id in 1..=3 {
         let store = HomeKvRaftLogStore::open(root.join(format!("node-{id}.raft"))).unwrap();
@@ -85,11 +87,12 @@ async fn healthy_quorum_elects_new_leader_and_preserves_acknowledged_state() {
             id,
             config.clone(),
             factories.get(&id).unwrap().clone(),
-            store,
+            store.clone(),
             sm.clone(),
         )
         .await
         .unwrap();
+        stores.insert(id, store.clone());
         state_machines.insert(id, sm);
         nodes.insert(id, raft);
     }
@@ -181,6 +184,41 @@ async fn healthy_quorum_elects_new_leader_and_preserves_acknowledged_state() {
         None
     );
 
+    // Retain evidence that the negative acknowledgement is backed by a real
+    // durable uncommitted suffix, not merely rejection before admission.
+    let mut old_store = stores[&old_leader].clone();
+    let committed_before_heal = old_store
+        .read_committed()
+        .await
+        .unwrap()
+        .expect("the acknowledged prefix must remain committed");
+    let speculative_log = old_store
+        .get_log_state()
+        .await
+        .unwrap()
+        .last_log_id
+        .expect("the isolated leader must retain its admitted entry");
+    assert!(
+        speculative_log.index > committed_before_heal.index,
+        "negative case must retain an actual uncommitted suffix: committed={committed_before_heal:?}, last={speculative_log:?}"
+    );
+    let speculative_entries = old_store
+        .try_get_log_entries(speculative_log.index..=speculative_log.index)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            speculative_entries.as_slice(),
+            [entry]
+                if matches!(
+                    &entry.payload,
+                    EntryPayload::Normal(RaftCommand::Set { key, value })
+                        if key == b"isolated-old-leader" && value == b"forbidden"
+                )
+        ),
+        "the retained suffix must contain the isolated leader's command: {speculative_entries:?}"
+    );
+
     // Exercise transient quorum failure deterministically. A cached Leader role
     // must not make the readiness helper succeed while every link is blocked.
     for a in 1..=3 {
@@ -200,7 +238,57 @@ async fn healthy_quorum_elects_new_leader_and_preserves_acknowledged_state() {
             links.heal_bidirectional(a, b);
         }
     }
-    readiness.await;
+    let healed_leader = readiness.await;
+    let expected = state_machines[&healed_leader].view().await;
+    assert_eq!(
+        state_machines[&healed_leader]
+            .get(b"isolated-old-leader")
+            .await,
+        None,
+        "the conflicting suffix must not become committed after healing"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let converged = {
+            let mut converged = true;
+            for sm in state_machines.values() {
+                converged &= sm.view().await == expected;
+                converged &= sm.get(b"isolated-old-leader").await.is_none();
+            }
+            converged
+        };
+        if converged {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "former leader did not converge after suffix reconciliation"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let committed_after_heal = old_store
+        .read_committed()
+        .await
+        .unwrap()
+        .expect("healed former leader must recover committed progress");
+    assert!(
+        committed_after_heal.index >= speculative_log.index,
+        "healed former leader did not advance through the conflicting suffix index"
+    );
+    let reconciled = old_store
+        .try_get_log_entries(speculative_log.index..=speculative_log.index)
+        .await
+        .unwrap();
+    assert!(
+        reconciled.iter().all(|entry| !matches!(
+            &entry.payload,
+            EntryPayload::Normal(RaftCommand::Set { key, value })
+                if key == b"isolated-old-leader" && value == b"forbidden"
+        )),
+        "the old leader's conflicting suffix survived reconciliation: {reconciled:?}"
+    );
 
     for raft in nodes.values() {
         raft.shutdown().await.unwrap();
