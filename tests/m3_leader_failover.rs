@@ -87,7 +87,7 @@ async fn healthy_quorum_elects_new_leader_and_preserves_acknowledged_state() {
             id,
             config.clone(),
             factories.get(&id).unwrap().clone(),
-            store,
+            store.clone(),
             sm.clone(),
         )
         .await
