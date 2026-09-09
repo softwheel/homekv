@@ -209,21 +209,6 @@ async fn lagging_follower_requires_snapshot_then_replays_subsequent_log() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    bounded(
-        "post-snapshot write",
-        nodes[&leader].client_write(RaftCommand::Set {
-            key: b"after-snapshot".to_vec(),
-            value: b"replayed".to_vec(),
-        }),
-    )
-    .await
-    .unwrap();
-    let expected = state_machines[&leader].view().await;
-    assert!(
-        expected.last_applied.unwrap().index > snapshot_index,
-        "the final state must include a log entry after the snapshot"
-    );
-
     for peer in 1..=3 {
         if peer != lagging {
             links.heal_bidirectional(lagging, peer);
@@ -244,6 +229,21 @@ async fn lagging_follower_requires_snapshot_then_replays_subsequent_log() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert_eq!(installed.meta, snapshot_meta);
+
+    bounded(
+        "post-install write",
+        nodes[&leader].client_write(RaftCommand::Set {
+            key: b"after-snapshot".to_vec(),
+            value: b"replayed".to_vec(),
+        }),
+    )
+    .await
+    .unwrap();
+    let expected = state_machines[&leader].view().await;
+    assert!(
+        expected.last_applied.unwrap().index > snapshot_index,
+        "the final state must include a committed log entry after snapshot installation"
+    );
     wait_for_state(
         &state_machines[&lagging],
         &expected,
