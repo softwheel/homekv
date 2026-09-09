@@ -397,9 +397,28 @@ impl RaftLogStorage<HomeKvRaftConfig> for HomeKvRaftLogStore {
             }
         }
         let durable_id = inner.state.logs.get(&log_id.index).map(|entry| entry.log_id);
-        if durable_id != Some(log_id) {
-            let err = io::Error::new(io::ErrorKind::InvalidInput, "Raft purge target is not a durable log entry");
-            return Err(Self::log_write_error(&err));
+        match durable_id {
+            Some(id) if id == log_id => {}
+            Some(_) => {
+                let err = io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Raft purge target identity does not match durable log entry",
+                );
+                return Err(Self::log_write_error(&err));
+            }
+            None => {
+                let last_local = inner.state.logs.values().next_back().map(|entry| entry.log_id);
+                if last_local.map(|id| log_id.index <= id.index).unwrap_or(false) {
+                    let err = io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Raft purge target is missing inside the durable log range",
+                    );
+                    return Err(Self::log_write_error(&err));
+                }
+                // Snapshot installation may advance a lagging follower's purged
+                // prefix beyond every log entry it ever held locally. OpenRaft
+                // supplies the validated snapshot's last log identity here.
+            }
         }
         let mut candidate = inner.state.clone();
         candidate.logs.retain(|index, _| *index > log_id.index);
@@ -447,6 +466,37 @@ mod tests {
             candidate.logs.insert(e.log_id.index, e);
         }
         HomeKvRaftLogStore::commit_candidate(&mut inner, candidate)
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_purge_may_advance_beyond_local_log() {
+        let path = temp_path("snapshot-install-purge");
+        let mut store = HomeKvRaftLogStore::open(&path).unwrap();
+        durable_append_for_test(&store, vec![entry(1)]).unwrap();
+        store.save_committed(Some(log_id(1))).await.unwrap();
+
+        let snapshot_log_id = LogId::new(CommittedLeaderId::new(2, 2), 10);
+        store.purge(snapshot_log_id).await.unwrap();
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(snapshot_log_id));
+        assert_eq!(state.last_log_id, Some(snapshot_log_id));
+        assert!(store.try_get_log_entries(..).await.unwrap().is_empty());
+
+        let next = Entry {
+            log_id: LogId::new(CommittedLeaderId::new(2, 2), 11),
+            payload: EntryPayload::Normal(RaftCommand::Set {
+                key: b"after-snapshot".to_vec(),
+                value: b"replayed".to_vec(),
+            }),
+        };
+        durable_append_for_test(&store, vec![next]).unwrap();
+        assert_eq!(store.get_log_state().await.unwrap().last_log_id.map(|id| id.index), Some(11));
+
+        drop(store);
+        let mut reopened = HomeKvRaftLogStore::open(&path).unwrap();
+        assert_eq!(reopened.get_log_state().await.unwrap().last_purged_log_id, Some(snapshot_log_id));
+        assert_eq!(reopened.try_get_log_entries(11..=11).await.unwrap().len(), 1);
+        fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
