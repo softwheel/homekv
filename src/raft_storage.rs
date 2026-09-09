@@ -4,7 +4,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
 use openraft::{Entry, LogId, OptionalSend, RaftLogReader, StorageError, StorageIOError, Vote};
@@ -16,6 +18,149 @@ use crate::raft::{HomeKvRaftConfig, RaftNodeId};
 const MAGIC: &[u8; 8] = b"HKVRLG01";
 const FORMAT_VERSION: u32 = 1;
 const HEADER_LEN: usize = 8 + 4 + 8 + 8;
+const LATENCY_UPPER_BOUNDS_MICROS: [u64; 7] = [100, 500, 1_000, 5_000, 10_000, 50_000, 250_000];
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LatencyHistogramSnapshot {
+    pub upper_bounds_micros: [u64; 7],
+    /// Eight disjoint buckets: one for each upper bound and a final overflow bucket.
+    pub bucket_counts: [u64; 8],
+    pub observations: u64,
+    pub total_micros: u64,
+    pub max_micros: u64,
+}
+
+#[derive(Debug)]
+struct LatencyHistogram {
+    buckets: [AtomicU64; 8],
+    observations: AtomicU64,
+    total_micros: AtomicU64,
+    max_micros: AtomicU64,
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            observations: AtomicU64::new(0),
+            total_micros: AtomicU64::new(0),
+            max_micros: AtomicU64::new(0),
+        }
+    }
+}
+
+impl LatencyHistogram {
+    fn record(&self, duration: Duration) {
+        let micros = duration.as_micros().min(u64::MAX as u128) as u64;
+        let bucket = LATENCY_UPPER_BOUNDS_MICROS
+            .iter()
+            .position(|upper| micros <= *upper)
+            .unwrap_or(LATENCY_UPPER_BOUNDS_MICROS.len());
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        self.observations.fetch_add(1, Ordering::Relaxed);
+        self.total_micros.fetch_add(micros, Ordering::Relaxed);
+        self.max_micros.fetch_max(micros, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> LatencyHistogramSnapshot {
+        LatencyHistogramSnapshot {
+            upper_bounds_micros: LATENCY_UPPER_BOUNDS_MICROS,
+            bucket_counts: std::array::from_fn(|index| {
+                self.buckets[index].load(Ordering::Relaxed)
+            }),
+            observations: self.observations.load(Ordering::Relaxed),
+            total_micros: self.total_micros.load(Ordering::Relaxed),
+            max_micros: self.max_micros.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RaftStorageMetricsSnapshot {
+    pub append_attempts: u64,
+    pub appended_entries: u64,
+    pub append_failures: u64,
+    pub durable_persist_attempts: u64,
+    pub durable_persist_failures: u64,
+    pub recovery_attempts: u64,
+    pub recovery_failures: u64,
+    pub append_latency: LatencyHistogramSnapshot,
+    pub durable_persist_latency: LatencyHistogramSnapshot,
+    pub recovery_latency: LatencyHistogramSnapshot,
+}
+
+#[derive(Debug, Default)]
+struct RaftStorageMetricsInner {
+    append_attempts: AtomicU64,
+    appended_entries: AtomicU64,
+    append_failures: AtomicU64,
+    durable_persist_attempts: AtomicU64,
+    durable_persist_failures: AtomicU64,
+    recovery_attempts: AtomicU64,
+    recovery_failures: AtomicU64,
+    append_latency: LatencyHistogram,
+    durable_persist_latency: LatencyHistogram,
+    recovery_latency: LatencyHistogram,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HomeKvRaftStorageMetrics {
+    inner: Arc<RaftStorageMetricsInner>,
+}
+
+impl HomeKvRaftStorageMetrics {
+    fn record_append(&self, entries: usize, duration: Duration, failed: bool) {
+        self.inner.append_attempts.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .appended_entries
+            .fetch_add(entries as u64, Ordering::Relaxed);
+        if failed {
+            self.inner.append_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.append_latency.record(duration);
+    }
+
+    fn record_persist(&self, duration: Duration, failed: bool) {
+        self.inner
+            .durable_persist_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        if failed {
+            self.inner
+                .durable_persist_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.durable_persist_latency.record(duration);
+    }
+
+    fn record_recovery(&self, duration: Duration, failed: bool) {
+        self.inner.recovery_attempts.fetch_add(1, Ordering::Relaxed);
+        if failed {
+            self.inner.recovery_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.recovery_latency.record(duration);
+    }
+
+    pub fn snapshot(&self) -> RaftStorageMetricsSnapshot {
+        RaftStorageMetricsSnapshot {
+            append_attempts: self.inner.append_attempts.load(Ordering::Relaxed),
+            appended_entries: self.inner.appended_entries.load(Ordering::Relaxed),
+            append_failures: self.inner.append_failures.load(Ordering::Relaxed),
+            durable_persist_attempts: self
+                .inner
+                .durable_persist_attempts
+                .load(Ordering::Relaxed),
+            durable_persist_failures: self
+                .inner
+                .durable_persist_failures
+                .load(Ordering::Relaxed),
+            recovery_attempts: self.inner.recovery_attempts.load(Ordering::Relaxed),
+            recovery_failures: self.inner.recovery_failures.load(Ordering::Relaxed),
+            append_latency: self.inner.append_latency.snapshot(),
+            durable_persist_latency: self.inner.durable_persist_latency.snapshot(),
+            recovery_latency: self.inner.recovery_latency.snapshot(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct PersistedState {
@@ -42,17 +187,30 @@ struct StoreInner {
 #[derive(Clone, Debug)]
 pub struct HomeKvRaftLogStore {
     inner: Arc<Mutex<StoreInner>>,
+    metrics: HomeKvRaftStorageMetrics,
 }
 
 impl HomeKvRaftLogStore {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_with_metrics(path, HomeKvRaftStorageMetrics::default())
+    }
+
+    pub fn open_with_metrics(
+        path: impl AsRef<Path>,
+        metrics: HomeKvRaftStorageMetrics,
+    ) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let state = if path.exists() {
-            Self::read_image(&path)?
+            let started = Instant::now();
+            let recovered = Self::read_image(&path).and_then(|state| {
+                Self::validate_state(&state)?;
+                Ok(state)
+            });
+            metrics.record_recovery(started.elapsed(), recovered.is_err());
+            recovered?
         } else {
             PersistedState::default()
         };
-        Self::validate_state(&state)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(StoreInner {
                 path,
@@ -60,7 +218,16 @@ impl HomeKvRaftLogStore {
                 #[cfg(test)]
                 fail_next_persist: false,
             })),
+            metrics,
         })
+    }
+
+    pub fn metrics(&self) -> RaftStorageMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    pub fn metrics_handle(&self) -> HomeKvRaftStorageMetrics {
+        self.metrics.clone()
     }
 
     fn lock(&self) -> io::Result<MutexGuard<'_, StoreInner>> {
@@ -159,49 +326,103 @@ impl HomeKvRaftLogStore {
         Ok(())
     }
 
-    fn persist_locked(inner: &mut StoreInner, candidate: &PersistedState) -> io::Result<()> {
-        #[cfg(test)]
-        if std::mem::take(&mut inner.fail_next_persist) {
-            return Err(io::Error::new(io::ErrorKind::Other, "injected Raft persistence failure"));
-        }
+    fn persist_locked(
+        inner: &mut StoreInner,
+        candidate: &PersistedState,
+        metrics: &HomeKvRaftStorageMetrics,
+    ) -> io::Result<()> {
+        let started = Instant::now();
+        let result = (|| -> io::Result<()> {
+            #[cfg(test)]
+            if std::mem::take(&mut inner.fail_next_persist) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "injected Raft persistence failure",
+                ));
+            }
 
-        Self::validate_state(candidate)?;
-        let image = Self::encode_image(candidate)?;
-        let parent = Self::parent_dir(&inner.path);
-        fs::create_dir_all(parent)?;
+            Self::validate_state(candidate)?;
+            let image = Self::encode_image(candidate)?;
+            let parent = Self::parent_dir(&inner.path);
+            fs::create_dir_all(parent)?;
 
-        let mut temp = inner.path.clone();
-        let temp_name = inner
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| format!(".{n}.tmp"))
-            .unwrap_or_else(|| ".homekv-raft.tmp".to_owned());
-        temp.set_file_name(temp_name);
+            let mut temp = inner.path.clone();
+            let temp_name = inner
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| format!(".{n}.tmp"))
+                .unwrap_or_else(|| ".homekv-raft.tmp".to_owned());
+            temp.set_file_name(temp_name);
 
-        let write_result = (|| -> io::Result<()> {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&temp)?;
-            file.write_all(&image)?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temp, &inner.path)?;
-            File::open(parent)?.sync_all()?;
-            Ok(())
+            let write_result = (|| -> io::Result<()> {
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&temp)?;
+                file.write_all(&image)?;
+                file.sync_all()?;
+                drop(file);
+                fs::rename(&temp, &inner.path)?;
+                File::open(parent)?.sync_all()?;
+                Ok(())
+            })();
+            if write_result.is_err() {
+                let _ = fs::remove_file(&temp);
+            }
+            write_result
         })();
-        if write_result.is_err() {
-            let _ = fs::remove_file(&temp);
-        }
-        write_result
+        metrics.record_persist(started.elapsed(), result.is_err());
+        result
     }
 
-    fn commit_candidate(inner: &mut StoreInner, candidate: PersistedState) -> io::Result<()> {
-        Self::persist_locked(inner, &candidate)?;
+    fn commit_candidate(
+        inner: &mut StoreInner,
+        candidate: PersistedState,
+        metrics: &HomeKvRaftStorageMetrics,
+    ) -> io::Result<()> {
+        Self::persist_locked(inner, &candidate, metrics)?;
         inner.state = candidate;
         Ok(())
+    }
+
+    fn append_entries(&self, entries: Vec<Entry<HomeKvRaftConfig>>) -> io::Result<()> {
+        let started = Instant::now();
+        let entry_count = entries.len();
+        let result = (|| -> io::Result<()> {
+            let mut inner = self.lock()?;
+            let mut candidate = inner.state.clone();
+            for window in entries.windows(2) {
+                if window[1].log_id.index != window[0].log_id.index + 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "non-consecutive Raft append batch",
+                    ));
+                }
+            }
+            if let Some(last) = candidate
+                .logs
+                .values()
+                .next_back()
+                .map(|entry| entry.log_id)
+                .or(candidate.last_purged_log_id)
+            {
+                if entries[0].log_id.index != last.index + 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Raft append would create a hole or overwrite without truncate",
+                    ));
+                }
+            }
+            for entry in entries {
+                candidate.logs.insert(entry.log_id.index, entry);
+            }
+            Self::commit_candidate(&mut inner, candidate, &self.metrics)
+        })();
+        self.metrics
+            .record_append(entry_count, started.elapsed(), result.is_err());
+        result
     }
 
     fn log_write_error(err: &io::Error) -> StorageError<RaftNodeId> {
@@ -275,7 +496,7 @@ impl RaftLogStorage<HomeKvRaftConfig> for HomeKvRaftLogStore {
         let mut inner = self.lock().map_err(|e| Self::vote_write_error(&e))?;
         let mut candidate = inner.state.clone();
         candidate.vote = Some(*vote);
-        Self::commit_candidate(&mut inner, candidate).map_err(|e| Self::vote_write_error(&e))
+        Self::commit_candidate(&mut inner, candidate, &self.metrics).map_err(|e| Self::vote_write_error(&e))
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<RaftNodeId>>, StorageError<RaftNodeId>> {
@@ -290,7 +511,7 @@ impl RaftLogStorage<HomeKvRaftConfig> for HomeKvRaftLogStore {
         let mut inner = self.lock().map_err(|e| Self::log_write_error(&e))?;
         let mut candidate = inner.state.clone();
         candidate.committed = committed;
-        Self::commit_candidate(&mut inner, candidate).map_err(|e| Self::log_write_error(&e))
+        Self::commit_candidate(&mut inner, candidate, &self.metrics).map_err(|e| Self::log_write_error(&e))
     }
 
     async fn read_committed(
@@ -315,30 +536,7 @@ impl RaftLogStorage<HomeKvRaftConfig> for HomeKvRaftLogStore {
             return Ok(());
         }
 
-        let result = (|| -> io::Result<()> {
-            let mut inner = self.lock()?;
-            let mut candidate = inner.state.clone();
-            for window in entries.windows(2) {
-                if window[1].log_id.index != window[0].log_id.index + 1 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "non-consecutive Raft append batch"));
-                }
-            }
-            if let Some(last) = candidate
-                .logs
-                .values()
-                .next_back()
-                .map(|entry| entry.log_id)
-                .or(candidate.last_purged_log_id)
-            {
-                if entries[0].log_id.index != last.index + 1 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Raft append would create a hole or overwrite without truncate"));
-                }
-            }
-            for entry in entries {
-                candidate.logs.insert(entry.log_id.index, entry);
-            }
-            Self::commit_candidate(&mut inner, candidate)
-        })();
+        let result = self.append_entries(entries);
 
         match result {
             Ok(()) => {
@@ -379,7 +577,7 @@ impl RaftLogStorage<HomeKvRaftConfig> for HomeKvRaftLogStore {
             let err = io::Error::new(io::ErrorKind::InvalidInput, "cannot truncate committed Raft progress");
             return Err(Self::log_write_error(&err));
         }
-        Self::commit_candidate(&mut inner, candidate).map_err(|e| Self::log_write_error(&e))
+        Self::commit_candidate(&mut inner, candidate, &self.metrics).map_err(|e| Self::log_write_error(&e))
     }
 
     async fn purge(
@@ -423,7 +621,7 @@ impl RaftLogStorage<HomeKvRaftConfig> for HomeKvRaftLogStore {
         let mut candidate = inner.state.clone();
         candidate.logs.retain(|index, _| *index > log_id.index);
         candidate.last_purged_log_id = Some(log_id);
-        Self::commit_candidate(&mut inner, candidate).map_err(|e| Self::log_write_error(&e))
+        Self::commit_candidate(&mut inner, candidate, &self.metrics).map_err(|e| Self::log_write_error(&e))
     }
 }
 
@@ -465,7 +663,7 @@ mod tests {
         for e in entries {
             candidate.logs.insert(e.log_id.index, e);
         }
-        HomeKvRaftLogStore::commit_candidate(&mut inner, candidate)
+        HomeKvRaftLogStore::commit_candidate(&mut inner, candidate, &store.metrics)
     }
 
     #[tokio::test]
@@ -592,4 +790,49 @@ mod tests {
         assert_eq!(reopened.inner.lock().unwrap().state.logs.len(), 1);
         let _ = fs::remove_file(path);
     }
+
+    #[test]
+    fn storage_metrics_cover_append_persist_and_failed_recovery() {
+        let path = temp_path("storage-metrics");
+        let metrics = HomeKvRaftStorageMetrics::default();
+        let store =
+            HomeKvRaftLogStore::open_with_metrics(&path, metrics.clone()).unwrap();
+
+        store.append_entries(vec![entry(1)]).unwrap();
+        store.inject_next_persist_failure();
+        assert!(store.append_entries(vec![entry(2)]).is_err());
+
+        let snapshot = store.metrics();
+        assert_eq!(snapshot.append_attempts, 2);
+        assert_eq!(snapshot.appended_entries, 2);
+        assert_eq!(snapshot.append_failures, 1);
+        assert_eq!(snapshot.durable_persist_attempts, 2);
+        assert_eq!(snapshot.durable_persist_failures, 1);
+        assert_eq!(snapshot.append_latency.observations, 2);
+        assert_eq!(
+            snapshot.append_latency.bucket_counts.iter().sum::<u64>(),
+            snapshot.append_latency.observations
+        );
+        assert_eq!(snapshot.durable_persist_latency.observations, 2);
+        assert!(!serde_json::to_string(&snapshot)
+            .unwrap()
+            .contains("openraft"));
+
+        drop(store);
+        let mut bytes = fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x5a;
+        fs::write(&path, bytes).unwrap();
+        assert!(HomeKvRaftLogStore::open_with_metrics(&path, metrics.clone()).is_err());
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.recovery_attempts, 1);
+        assert_eq!(snapshot.recovery_failures, 1);
+        assert_eq!(snapshot.recovery_latency.observations, 1);
+        assert_eq!(
+            snapshot.recovery_latency.bucket_counts.iter().sum::<u64>(),
+            1
+        );
+        let _ = fs::remove_file(path);
+    }
+
 }
