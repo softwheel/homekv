@@ -213,6 +213,46 @@ Before the final verification PR:
 
 ## 14. Final M3 verification record
 
+### PR #52: retained-log restart verification slice
+
+The following tests contribute partial M3-T5 evidence; they do not mark M3-T5
+complete or change this spec to Verified:
+
+- `restarted_replica_replays_committed_history_and_catches_up`: three voters,
+  acknowledged SET/overwrite/BATCH/DELETE history, a follower shut down with an
+  existing durable log, and a second write acknowledged by the surviving quorum.
+  The fresh state machine must first recover the exact pre-shutdown data,
+  membership and applied identity while both network directions remain isolated.
+  Only then are links restored to check full-map catch-up and applied progress.
+- `restart_does_not_apply_durable_uncommitted_suffix`: a deterministic follower
+  fixture receives committed-prefix and uncommitted-suffix entries through
+  OpenRaft AppendEntries. Reopening the file must prove that the suffix really
+  exists beyond the durable committed position. Fresh-state-machine recovery
+  must restore only the committed prefix, including membership/applied metadata.
+  This fixture is a recovery-safety test, not a simulated client quorum proof.
+- `healthy_quorum_elects_new_leader_and_preserves_acknowledged_state`: readiness
+  requires a successful real quorum read barrier within five seconds. Transient
+  not-leader/quorum errors may be retried; fatal errors fail immediately. An
+  explicit all-links partition verifies that a cached Leader role cannot satisfy
+  readiness without quorum, and healing must allow the same wait to complete.
+
+Scope mapping: retained-log cases contribute to DUR-006/007, FAIL-004 and
+acceptance item 5. Snapshot recovery (SNAP-004), former-leader conflicting suffix
+reconciliation, abrupt process loss, and the rest of the mandatory matrix remain
+separate work. Snapshot creation is explicitly disabled in the restart tests so
+peer snapshot repair cannot be mistaken for local log replay.
+
+Historical diagnosis: Rust run 33368459304 failed in the existing leader-failover
+test's immediate read barrier with `QuorumNotEnough`; it did not execute the
+restart test. The original failure's exact timing cause was not established.
+The readiness change removes the unsupported assumption that observing Leader
+implies an immediately successful read barrier, without bypassing that barrier.
+
+The Rust workflow retains the tested checkout SHA, toolchain/host/filesystem,
+lockfile digest and OpenRaft resolution, full test output, and completed M0 smoke
+outputs in `rust-verification-<run-id>-<attempt>`. Use a passing complete run and
+the PR head/merge SHA mapping as evidence; skipped gates are not passes.
+
 M3-T7 will replace `Pending` states with PASS/FAIL and record:
 
 - exact tested SHA;
