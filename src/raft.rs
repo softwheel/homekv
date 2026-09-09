@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{self, Cursor};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Cursor, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot, SnapshotMeta};
@@ -76,10 +78,44 @@ const SNAPSHOT_VERSION: u16 = 1;
 const M3_SHARD_ID: u64 = 0;
 const SNAPSHOT_HEADER_LEN: usize = 8 + 8 + 8;
 
-#[derive(Clone, Debug, Default)]
-pub struct HomeKvStateMachine { inner: Arc<RwLock<StateMachineData>> }
+#[derive(Clone, Debug)]
+pub struct HomeKvStateMachine {
+    inner: Arc<RwLock<StateMachineData>>,
+    snapshot_path: Option<Arc<PathBuf>>,
+}
+
+impl Default for HomeKvStateMachine {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(StateMachineData::default())),
+            snapshot_path: None,
+        }
+    }
+}
 
 impl HomeKvStateMachine {
+    pub fn open(snapshot_path: impl AsRef<Path>) -> Result<Self, StorageError<RaftNodeId>> {
+        let path = snapshot_path.as_ref().to_path_buf();
+        let state = match fs::read(&path) {
+            Ok(bytes) => {
+                let image = Self::decode_snapshot(&bytes)?;
+                let meta = Self::snapshot_meta(&image);
+                StateMachineData {
+                    last_applied: image.last_applied,
+                    membership: image.membership,
+                    data: image.data,
+                    current_snapshot: Some((meta, bytes)),
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => StateMachineData::default(),
+            Err(_) => return Err(Self::storage_error("snapshot read failed")),
+        };
+        Ok(Self {
+            inner: Arc::new(RwLock::new(state)),
+            snapshot_path: Some(Arc::new(path)),
+        })
+    }
+
     pub async fn view(&self) -> StateMachineView {
         let state = self.inner.read().await;
         StateMachineView { last_applied: state.last_applied, membership: state.membership.clone(), data: state.data.clone() }
@@ -90,6 +126,48 @@ impl HomeKvStateMachine {
     fn storage_error(message: &'static str) -> StorageError<RaftNodeId> {
         let err = io::Error::new(io::ErrorKind::InvalidData, message);
         StorageIOError::read_state_machine(&err).into()
+    }
+
+    fn snapshot_meta(image: &SnapshotImage) -> SnapshotMeta<RaftNodeId, RaftNode> {
+        let snapshot_id = match image.last_applied {
+            Some(id) => format!("m3-{}-{}", id.leader_id.term, id.index),
+            None => "m3-empty".to_string(),
+        };
+        SnapshotMeta {
+            last_log_id: image.last_applied,
+            last_membership: image.membership.clone(),
+            snapshot_id,
+        }
+    }
+
+    fn persist_snapshot(&self, bytes: &[u8]) -> Result<(), StorageError<RaftNodeId>> {
+        let Some(path) = self.snapshot_path.as_deref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)
+                .map_err(|_| Self::storage_error("snapshot directory creation failed"))?;
+        }
+        let temporary = path.with_extension("tmp");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|_| Self::storage_error("snapshot temporary file open failed"))?;
+        file.write_all(bytes)
+            .map_err(|_| Self::storage_error("snapshot write failed"))?;
+        file.sync_all()
+            .map_err(|_| Self::storage_error("snapshot file sync failed"))?;
+        drop(file);
+        fs::rename(&temporary, path)
+            .map_err(|_| Self::storage_error("snapshot atomic replacement failed"))?;
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| Self::storage_error("snapshot directory sync failed"))?;
+        }
+        Ok(())
     }
 
     fn encode_snapshot(image: &SnapshotImage) -> Result<Vec<u8>, StorageError<RaftNodeId>> {
@@ -137,15 +215,18 @@ pub struct HomeKvSnapshotBuilder { state_machine: HomeKvStateMachine }
 
 impl RaftSnapshotBuilder<HomeKvRaftConfig> for HomeKvSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<HomeKvRaftConfig>, StorageError<RaftNodeId>> {
-        let (image, meta) = {
-            let state = self.state_machine.inner.read().await;
-            let image = SnapshotImage { format_version: SNAPSHOT_VERSION, shard_id: M3_SHARD_ID, last_applied: state.last_applied, membership: state.membership.clone(), data: state.data.clone() };
-            let snapshot_id = match state.last_applied { Some(id) => format!("m3-{}-{}", id.leader_id.term, id.index), None => "m3-empty".to_string() };
-            let meta = SnapshotMeta { last_log_id: state.last_applied, last_membership: state.membership.clone(), snapshot_id };
-            (image, meta)
+        let mut state = self.state_machine.inner.write().await;
+        let image = SnapshotImage {
+            format_version: SNAPSHOT_VERSION,
+            shard_id: M3_SHARD_ID,
+            last_applied: state.last_applied,
+            membership: state.membership.clone(),
+            data: state.data.clone(),
         };
+        let meta = HomeKvStateMachine::snapshot_meta(&image);
         let bytes = HomeKvStateMachine::encode_snapshot(&image)?;
-        self.state_machine.inner.write().await.current_snapshot = Some((meta.clone(), bytes.clone()));
+        self.state_machine.persist_snapshot(&bytes)?;
+        state.current_snapshot = Some((meta.clone(), bytes.clone()));
         Ok(Snapshot { meta, snapshot: Box::new(Cursor::new(bytes)) })
     }
 }
@@ -189,6 +270,7 @@ impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
         let image = Self::decode_snapshot(&bytes)?;
         if image.last_applied != meta.last_log_id || image.membership != meta.last_membership { return Err(Self::storage_error("snapshot metadata mismatch")); }
         let mut state = self.inner.write().await;
+        self.persist_snapshot(&bytes)?;
         state.last_applied = image.last_applied;
         state.membership = image.membership;
         state.data = image.data;
@@ -206,11 +288,17 @@ impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Read;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use openraft::{CommittedLeaderId, Membership};
     use super::*;
 
     fn log_id(index: u64) -> LogId<RaftNodeId> { LogId::new(CommittedLeaderId::new(1, 1), index) }
     fn normal(index: u64, command: RaftCommand) -> Entry<HomeKvRaftConfig> { Entry { log_id: log_id(index), payload: EntryPayload::Normal(command) } }
+
+    fn snapshot_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("homekv-{name}-{}-{nonce}.snapshot", std::process::id()))
+    }
 
     #[tokio::test]
     async fn applies_commands_in_committed_order() {
@@ -249,6 +337,66 @@ mod tests {
         let mut restored = HomeKvStateMachine::default(); restored.install_snapshot(&snapshot.meta, snapshot.snapshot).await.unwrap();
         assert_eq!(restored.view().await, source.view().await);
         assert!(restored.get_current_snapshot().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn durable_snapshot_reopens_and_accepts_subsequent_log_replay() {
+        let path = snapshot_path("reopen");
+        let mut source = HomeKvStateMachine::open(&path).unwrap();
+        source.apply(vec![
+            normal(1, RaftCommand::Set { key: b"a".to_vec(), value: b"one".to_vec() }),
+            normal(2, RaftCommand::Set { key: b"b".to_vec(), value: b"two".to_vec() }),
+        ]).await.unwrap();
+        source.get_snapshot_builder().await.build_snapshot().await.unwrap();
+        drop(source);
+
+        let mut recovered = HomeKvStateMachine::open(&path).unwrap();
+        assert_eq!(recovered.get(b"a").await, Some(b"one".to_vec()));
+        assert_eq!(recovered.view().await.last_applied, Some(log_id(2)));
+        recovered.apply(vec![
+            normal(3, RaftCommand::Delete { key: b"a".to_vec() }),
+            normal(4, RaftCommand::Set { key: b"c".to_vec(), value: b"three".to_vec() }),
+        ]).await.unwrap();
+        let view = recovered.view().await;
+        assert_eq!(view.last_applied, Some(log_id(4)));
+        assert_eq!(view.data, BTreeMap::from([
+            (b"b".to_vec(), b"two".to_vec()),
+            (b"c".to_vec(), b"three".to_vec()),
+        ]));
+        assert!(recovered.get_current_snapshot().await.unwrap().is_some());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_temporary_snapshot_never_replaces_last_durable_image() {
+        let path = snapshot_path("interrupted");
+        let mut source = HomeKvStateMachine::open(&path).unwrap();
+        source.apply(vec![normal(1, RaftCommand::Set { key: b"k".to_vec(), value: b"safe".to_vec() })]).await.unwrap();
+        source.get_snapshot_builder().await.build_snapshot().await.unwrap();
+        fs::write(path.with_extension("tmp"), b"incomplete").unwrap();
+        drop(source);
+
+        let recovered = HomeKvStateMachine::open(&path).unwrap();
+        assert_eq!(recovered.get(b"k").await, Some(b"safe".to_vec()));
+        assert_eq!(recovered.view().await.last_applied, Some(log_id(1)));
+        fs::remove_file(path.with_extension("tmp")).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_durable_snapshot_fails_closed_on_reopen() {
+        let path = snapshot_path("corrupt");
+        let mut source = HomeKvStateMachine::open(&path).unwrap();
+        source.apply(vec![normal(1, RaftCommand::Set { key: b"k".to_vec(), value: b"safe".to_vec() })]).await.unwrap();
+        source.get_snapshot_builder().await.build_snapshot().await.unwrap();
+        drop(source);
+
+        let mut bytes = fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&path, bytes).unwrap();
+        assert!(HomeKvStateMachine::open(&path).is_err());
+        fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
