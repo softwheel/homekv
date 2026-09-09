@@ -231,6 +231,24 @@ async fn compact_contract_routes_strong_operations_through_raft_authority() {
     assert_eq!(final_get.status, Status::Ok);
     assert_eq!(final_get.body, b"value");
 
+    let leader_metrics = leader_handler.metrics();
+    assert_eq!(leader_metrics.read_requests, 2);
+    assert_eq!(leader_metrics.write_requests, 2);
+    assert_eq!(leader_metrics.successful_reads, 2);
+    assert_eq!(leader_metrics.successful_writes, 1);
+    assert_eq!(leader_metrics.invalid_responses, 1);
+    assert_eq!(leader_metrics.not_leader_responses, 0);
+    assert_eq!(leader_metrics.admission_current, 0);
+    assert!(leader_metrics.admission_peak >= 1);
+    assert_eq!(leader_metrics.admission_rejections, 0);
+
+    let follower_metrics = follower_handler.metrics();
+    assert_eq!(follower_metrics.read_requests, 1);
+    assert_eq!(follower_metrics.write_requests, 1);
+    assert_eq!(follower_metrics.not_leader_responses, 2);
+    assert_eq!(follower_metrics.admission_current, 0);
+    assert_eq!(follower_metrics.admission_peak, 0);
+
     cluster.stop().await;
 }
 
@@ -244,7 +262,7 @@ async fn admitted_write_survives_transport_future_cancellation() {
         cluster.nodes.get(&leader).unwrap().clone(),
         cluster.state_machines.get(&leader).unwrap().clone(),
         shard,
-        8,
+        1,
     );
 
     // Hold replication long enough to cancel the caller after admission but before quorum
@@ -274,6 +292,35 @@ async fn admitted_write_survives_transport_future_cancellation() {
     transport.abort();
     assert!(transport.await.unwrap_err().is_cancelled());
 
+    let admission_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if handler.metrics().admission_current == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < admission_deadline,
+            "detached consensus work did not retain its admission slot"
+        );
+        tokio::task::yield_now().await;
+    }
+    let overloaded = handler
+        .handle(request(
+            12,
+            shard,
+            RequestBody::Set {
+                key: key.clone(),
+                value: b"must-not-enter-unbounded-backlog".to_vec(),
+            },
+        ))
+        .await;
+    assert_eq!(overloaded.status, Status::Overloaded);
+    let saturated = handler.metrics();
+    assert_eq!(saturated.admission_capacity, 1);
+    assert_eq!(saturated.admission_current, 1);
+    assert_eq!(saturated.admission_peak, 1);
+    assert_eq!(saturated.admission_rejections, 1);
+    assert_eq!(saturated.overload_responses, 1);
+
     for peer in [1_u64, 2, 3].into_iter().filter(|id| *id != leader) {
         cluster.links.heal(leader, peer);
     }
@@ -297,6 +344,17 @@ async fn admitted_write_survives_transport_future_cancellation() {
         .await;
     assert_eq!(read.status, Status::Ok);
     assert_eq!(read.body, b"committed-after-cancel");
+
+    let completed = handler.metrics();
+    assert_eq!(completed.read_requests, 1);
+    assert_eq!(completed.write_requests, 2);
+    assert_eq!(completed.successful_reads, 1);
+    assert_eq!(completed.successful_writes, 0);
+    assert_eq!(completed.overload_responses, 1);
+    assert_eq!(completed.admission_capacity, 1);
+    assert_eq!(completed.admission_current, 0);
+    assert_eq!(completed.admission_peak, 1);
+    assert_eq!(completed.admission_rejections, 1);
 
     cluster.stop().await;
 }
