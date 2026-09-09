@@ -229,20 +229,27 @@ async fn lagging_follower_requires_snapshot_then_replays_subsequent_log() {
             links.heal_bidirectional(lagging, peer);
         }
     }
+    let mut lagging_sm = state_machines[&lagging].clone();
+    let install_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let installed = loop {
+        if let Some(snapshot) = lagging_sm.get_current_snapshot().await.unwrap() {
+            if snapshot.meta == snapshot_meta {
+                break snapshot;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < install_deadline,
+            "lagging follower did not install the exact leader snapshot"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(installed.meta, snapshot_meta);
     wait_for_state(
         &state_machines[&lagging],
         &expected,
-        "snapshot install and subsequent replay",
+        "subsequent log replay after snapshot install",
     )
     .await;
-
-    let mut lagging_sm = state_machines[&lagging].clone();
-    let installed = lagging_sm
-        .get_current_snapshot()
-        .await
-        .unwrap()
-        .expect("snapshot policy is disabled on the follower, so a snapshot here proves install");
-    assert_eq!(installed.meta, snapshot_meta);
     assert!(
         fs::metadata(root.join(format!("node-{lagging}.snapshot")))
             .unwrap()
