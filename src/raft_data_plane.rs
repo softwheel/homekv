@@ -1,14 +1,151 @@
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use openraft::raft::Raft;
 use openraft::ServerState;
-use tokio::sync::Semaphore;
+use serde_derive::{Deserialize, Serialize};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::data_plane::{Mutation as WireMutation, Request, RequestBody, Status};
 use crate::data_plane_runtime::{HandlerResponse, RequestHandler};
 use crate::raft::{HomeKvRaftConfig, HomeKvStateMachine, RaftCommand, RaftMutation};
 use crate::storage::shard_for_key;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReplicatedHandlerMetricsSnapshot {
+    pub read_requests: u64,
+    pub write_requests: u64,
+    pub successful_reads: u64,
+    pub successful_writes: u64,
+    pub not_found_responses: u64,
+    pub not_leader_responses: u64,
+    pub unavailable_responses: u64,
+    pub overload_responses: u64,
+    pub invalid_responses: u64,
+    pub internal_error_responses: u64,
+    pub admission_capacity: usize,
+    pub admission_current: usize,
+    pub admission_peak: usize,
+    pub admission_rejections: u64,
+}
+
+#[derive(Debug)]
+struct ReplicatedHandlerMetrics {
+    read_requests: AtomicU64,
+    write_requests: AtomicU64,
+    successful_reads: AtomicU64,
+    successful_writes: AtomicU64,
+    not_found_responses: AtomicU64,
+    not_leader_responses: AtomicU64,
+    unavailable_responses: AtomicU64,
+    overload_responses: AtomicU64,
+    invalid_responses: AtomicU64,
+    internal_error_responses: AtomicU64,
+    admission_capacity: usize,
+    admission_current: AtomicUsize,
+    admission_peak: AtomicUsize,
+    admission_rejections: AtomicU64,
+}
+
+impl ReplicatedHandlerMetrics {
+    fn new(admission_capacity: usize) -> Self {
+        Self {
+            read_requests: AtomicU64::new(0),
+            write_requests: AtomicU64::new(0),
+            successful_reads: AtomicU64::new(0),
+            successful_writes: AtomicU64::new(0),
+            not_found_responses: AtomicU64::new(0),
+            not_leader_responses: AtomicU64::new(0),
+            unavailable_responses: AtomicU64::new(0),
+            overload_responses: AtomicU64::new(0),
+            invalid_responses: AtomicU64::new(0),
+            internal_error_responses: AtomicU64::new(0),
+            admission_capacity,
+            admission_current: AtomicUsize::new(0),
+            admission_peak: AtomicUsize::new(0),
+            admission_rejections: AtomicU64::new(0),
+        }
+    }
+
+    fn request_started(&self, read: bool) {
+        if read {
+            self.read_requests.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.write_requests.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_outcome(&self, read: bool, status: Status) {
+        match status {
+            Status::Ok if read => {
+                self.successful_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            Status::Ok => {
+                self.successful_writes.fetch_add(1, Ordering::Relaxed);
+            }
+            Status::NotFound => {
+                self.not_found_responses.fetch_add(1, Ordering::Relaxed);
+            }
+            Status::StaleRouteOrNotOwner => {
+                self.not_leader_responses.fetch_add(1, Ordering::Relaxed);
+            }
+            Status::ClosedOrUnavailable => {
+                self.unavailable_responses.fetch_add(1, Ordering::Relaxed);
+            }
+            Status::Overloaded => {
+                self.overload_responses.fetch_add(1, Ordering::Relaxed);
+            }
+            Status::WrongShard | Status::MalformedRequest => {
+                self.invalid_responses.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                self.internal_error_responses.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn admitted(self: &Arc<Self>) -> AdmissionGauge {
+        let current = self.admission_current.fetch_add(1, Ordering::Relaxed) + 1;
+        self.admission_peak.fetch_max(current, Ordering::Relaxed);
+        AdmissionGauge {
+            metrics: self.clone(),
+        }
+    }
+
+    fn rejected(&self) {
+        self.admission_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ReplicatedHandlerMetricsSnapshot {
+        ReplicatedHandlerMetricsSnapshot {
+            read_requests: self.read_requests.load(Ordering::Relaxed),
+            write_requests: self.write_requests.load(Ordering::Relaxed),
+            successful_reads: self.successful_reads.load(Ordering::Relaxed),
+            successful_writes: self.successful_writes.load(Ordering::Relaxed),
+            not_found_responses: self.not_found_responses.load(Ordering::Relaxed),
+            not_leader_responses: self.not_leader_responses.load(Ordering::Relaxed),
+            unavailable_responses: self.unavailable_responses.load(Ordering::Relaxed),
+            overload_responses: self.overload_responses.load(Ordering::Relaxed),
+            invalid_responses: self.invalid_responses.load(Ordering::Relaxed),
+            internal_error_responses: self.internal_error_responses.load(Ordering::Relaxed),
+            admission_capacity: self.admission_capacity,
+            admission_current: self.admission_current.load(Ordering::Relaxed),
+            admission_peak: self.admission_peak.load(Ordering::Relaxed),
+            admission_rejections: self.admission_rejections.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct AdmissionGauge {
+    metrics: Arc<ReplicatedHandlerMetrics>,
+}
+
+impl Drop for AdmissionGauge {
+    fn drop(&mut self) {
+        self.metrics.admission_current.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 #[derive(Clone)]
 pub struct ReplicatedShardRequestHandler {
@@ -16,6 +153,7 @@ pub struct ReplicatedShardRequestHandler {
     state_machine: HomeKvStateMachine,
     shard_id: u16,
     admission: Arc<Semaphore>,
+    metrics: Arc<ReplicatedHandlerMetrics>,
 }
 
 impl ReplicatedShardRequestHandler {
@@ -31,6 +169,21 @@ impl ReplicatedShardRequestHandler {
             state_machine,
             shard_id,
             admission: Arc::new(Semaphore::new(max_inflight)),
+            metrics: Arc::new(ReplicatedHandlerMetrics::new(max_inflight)),
+        }
+    }
+
+    pub fn metrics(&self) -> ReplicatedHandlerMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    fn try_admit(&self) -> Result<(OwnedSemaphorePermit, AdmissionGauge), ()> {
+        match self.admission.clone().try_acquire_owned() {
+            Ok(permit) => Ok((permit, self.metrics.admitted())),
+            Err(_) => {
+                self.metrics.rejected();
+                Err(())
+            }
         }
     }
 
@@ -94,7 +247,7 @@ impl ReplicatedShardRequestHandler {
         if !self.is_current_leader() {
             return HandlerResponse::new(Status::StaleRouteOrNotOwner, Vec::new());
         }
-        let Ok(_permit) = self.admission.clone().try_acquire_owned() else {
+        let Ok((_permit, _admission)) = self.try_admit() else {
             return HandlerResponse::new(Status::Overloaded, Vec::new());
         };
 
@@ -117,7 +270,7 @@ impl ReplicatedShardRequestHandler {
         if !self.is_current_leader() {
             return HandlerResponse::new(Status::StaleRouteOrNotOwner, Vec::new());
         }
-        let Ok(permit) = self.admission.clone().try_acquire_owned() else {
+        let Ok((permit, admission)) = self.try_admit() else {
             return HandlerResponse::new(Status::Overloaded, Vec::new());
         };
 
@@ -128,6 +281,7 @@ impl ReplicatedShardRequestHandler {
         let raft = self.raft.clone();
         let admitted = tokio::spawn(async move {
             let _permit = permit;
+            let _admission = admission;
             raft.client_write(command).await
         });
 
@@ -162,7 +316,11 @@ impl ReplicatedShardRequestHandler {
 #[async_trait]
 impl RequestHandler for ReplicatedShardRequestHandler {
     async fn handle(&self, request: Request) -> HandlerResponse {
-        self.execute(request).await
+        let read = matches!(&request.body, RequestBody::Get { .. });
+        self.metrics.request_started(read);
+        let response = self.execute(request).await;
+        self.metrics.record_outcome(read, response.status);
+        response
     }
 }
 
