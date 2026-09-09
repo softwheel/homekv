@@ -297,7 +297,7 @@ async fn abandoned_or_corrupt_snapshot_receive_preserves_durable_state() {
         }])
         .await
         .unwrap();
-    let snapshot = source
+    let mut snapshot = source
         .get_snapshot_builder()
         .await
         .build_snapshot()
