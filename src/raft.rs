@@ -24,6 +24,7 @@ pub enum RaftCommand {
     Set { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
     Batch { mutations: Vec<RaftMutation> },
+
 }
 
 impl fmt::Display for RaftCommand {
@@ -100,6 +101,22 @@ struct ApplyLatencyHistogram {
     max_micros: AtomicU64,
 }
 
+pub type SnapshotLatencyHistogramSnapshot = ApplyLatencyHistogramSnapshot;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SnapshotMetricsSnapshot {
+    pub build_attempts: u64,
+    pub builds_succeeded: u64,
+    pub build_failures: u64,
+    pub build_bytes: u64,
+    pub install_attempts: u64,
+    pub installs_succeeded: u64,
+    pub install_failures: u64,
+    pub install_bytes: u64,
+    pub build_latency: SnapshotLatencyHistogramSnapshot,
+    pub install_latency: SnapshotLatencyHistogramSnapshot,
+}
+
 impl Default for ApplyLatencyHistogram {
     fn default() -> Self {
         Self {
@@ -163,6 +180,16 @@ struct StateMachineApplyMetricsInner {
     mutations_applied: AtomicU64,
     apply_failures: AtomicU64,
     apply_latency: ApplyLatencyHistogram,
+    snapshot_build_attempts: AtomicU64,
+    snapshot_builds_succeeded: AtomicU64,
+    snapshot_build_failures: AtomicU64,
+    snapshot_build_bytes: AtomicU64,
+    snapshot_install_attempts: AtomicU64,
+    snapshot_installs_succeeded: AtomicU64,
+    snapshot_install_failures: AtomicU64,
+    snapshot_install_bytes: AtomicU64,
+    snapshot_build_latency: ApplyLatencyHistogram,
+    snapshot_install_latency: ApplyLatencyHistogram,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -225,6 +252,59 @@ impl HomeKvStateMachineMetrics {
             apply_latency: self.inner.apply_latency.snapshot(),
         }
     }
+
+    fn record_snapshot_build(&self, duration: Duration, bytes: u64, failed: bool) {
+        self.inner
+            .snapshot_build_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        if failed {
+            self.inner
+                .snapshot_build_failures
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.inner
+                .snapshot_builds_succeeded
+                .fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .snapshot_build_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+        self.inner.snapshot_build_latency.record(duration);
+    }
+
+    fn record_snapshot_install(&self, duration: Duration, bytes: u64, failed: bool) {
+        self.inner
+            .snapshot_install_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        if failed {
+            self.inner
+                .snapshot_install_failures
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.inner
+                .snapshot_installs_succeeded
+                .fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .snapshot_install_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+        self.inner.snapshot_install_latency.record(duration);
+    }
+
+    pub fn snapshot_operations(&self) -> SnapshotMetricsSnapshot {
+        SnapshotMetricsSnapshot {
+            build_attempts: self.inner.snapshot_build_attempts.load(Ordering::Relaxed),
+            builds_succeeded: self.inner.snapshot_builds_succeeded.load(Ordering::Relaxed),
+            build_failures: self.inner.snapshot_build_failures.load(Ordering::Relaxed),
+            build_bytes: self.inner.snapshot_build_bytes.load(Ordering::Relaxed),
+            install_attempts: self.inner.snapshot_install_attempts.load(Ordering::Relaxed),
+            installs_succeeded: self.inner.snapshot_installs_succeeded.load(Ordering::Relaxed),
+            install_failures: self.inner.snapshot_install_failures.load(Ordering::Relaxed),
+            install_bytes: self.inner.snapshot_install_bytes.load(Ordering::Relaxed),
+            build_latency: self.inner.snapshot_build_latency.snapshot(),
+            install_latency: self.inner.snapshot_install_latency.snapshot(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -277,6 +357,10 @@ impl HomeKvStateMachine {
 
     pub fn metrics(&self) -> StateMachineApplyMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    pub fn snapshot_metrics(&self) -> SnapshotMetricsSnapshot {
+        self.metrics.snapshot_operations()
     }
 
     fn storage_error(message: &'static str) -> StorageError<RaftNodeId> {
@@ -371,19 +455,33 @@ pub struct HomeKvSnapshotBuilder { state_machine: HomeKvStateMachine }
 
 impl RaftSnapshotBuilder<HomeKvRaftConfig> for HomeKvSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<HomeKvRaftConfig>, StorageError<RaftNodeId>> {
-        let mut state = self.state_machine.inner.write().await;
-        let image = SnapshotImage {
-            format_version: SNAPSHOT_VERSION,
-            shard_id: M3_SHARD_ID,
-            last_applied: state.last_applied,
-            membership: state.membership.clone(),
-            data: state.data.clone(),
-        };
-        let meta = HomeKvStateMachine::snapshot_meta(&image);
-        let bytes = HomeKvStateMachine::encode_snapshot(&image)?;
-        self.state_machine.persist_snapshot(&bytes)?;
-        state.current_snapshot = Some((meta.clone(), bytes.clone()));
-        Ok(Snapshot { meta, snapshot: Box::new(Cursor::new(bytes)) })
+        let started = Instant::now();
+        let result = async {
+            let mut state = self.state_machine.inner.write().await;
+            let image = SnapshotImage {
+                format_version: SNAPSHOT_VERSION,
+                shard_id: M3_SHARD_ID,
+                last_applied: state.last_applied,
+                membership: state.membership.clone(),
+                data: state.data.clone(),
+            };
+            let meta = HomeKvStateMachine::snapshot_meta(&image);
+            let bytes = HomeKvStateMachine::encode_snapshot(&image)?;
+            self.state_machine.persist_snapshot(&bytes)?;
+            state.current_snapshot = Some((meta.clone(), bytes.clone()));
+            Ok(Snapshot { meta, snapshot: Box::new(Cursor::new(bytes)) })
+        }
+        .await;
+        let bytes = result
+            .as_ref()
+            .map(|snapshot| snapshot.snapshot.get_ref().len() as u64)
+            .unwrap_or(0);
+        self.state_machine.metrics.record_snapshot_build(
+            started.elapsed(),
+            bytes,
+            result.is_err(),
+        );
+        result
     }
 }
 
@@ -452,16 +550,27 @@ impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
     }
 
     async fn install_snapshot(&mut self, meta: &SnapshotMeta<RaftNodeId, RaftNode>, snapshot: Box<<HomeKvRaftConfig as openraft::RaftTypeConfig>::SnapshotData>) -> Result<(), StorageError<RaftNodeId>> {
+        let started = Instant::now();
         let bytes = snapshot.into_inner();
-        let image = Self::decode_snapshot(&bytes)?;
-        if image.last_applied != meta.last_log_id || image.membership != meta.last_membership { return Err(Self::storage_error("snapshot metadata mismatch")); }
-        let mut state = self.inner.write().await;
-        self.persist_snapshot(&bytes)?;
-        state.last_applied = image.last_applied;
-        state.membership = image.membership;
-        state.data = image.data;
-        state.current_snapshot = Some((meta.clone(), bytes));
-        Ok(())
+        let byte_count = bytes.len() as u64;
+        let result = async {
+            let image = Self::decode_snapshot(&bytes)?;
+            if image.last_applied != meta.last_log_id || image.membership != meta.last_membership { return Err(Self::storage_error("snapshot metadata mismatch")); }
+            let mut state = self.inner.write().await;
+            self.persist_snapshot(&bytes)?;
+            state.last_applied = image.last_applied;
+            state.membership = image.membership;
+            state.data = image.data;
+            state.current_snapshot = Some((meta.clone(), bytes));
+            Ok(())
+        }
+        .await;
+        self.metrics.record_snapshot_install(
+            started.elapsed(),
+            if result.is_ok() { byte_count } else { 0 },
+            result.is_err(),
+        );
+        result
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<HomeKvRaftConfig>>, StorageError<RaftNodeId>> {
@@ -682,5 +791,86 @@ mod tests {
             .unwrap()
             .contains("openraft"));
     }
+
+    #[tokio::test]
+    async fn snapshot_metrics_track_success_corruption_and_persistence_failure() {
+        let mut source = HomeKvStateMachine::default();
+        source
+            .apply(vec![normal(
+                1,
+                RaftCommand::Set {
+                    key: b"k".to_vec(),
+                    value: b"value".to_vec(),
+                },
+            )])
+            .await
+            .unwrap();
+        let snapshot = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let source_metrics = source.snapshot_metrics();
+        assert_eq!(source_metrics.build_attempts, 1);
+        assert_eq!(source_metrics.builds_succeeded, 1);
+        assert_eq!(source_metrics.build_failures, 0);
+        assert!(source_metrics.build_bytes > SNAPSHOT_HEADER_LEN as u64);
+        assert_eq!(source_metrics.build_latency.observations, 1);
+
+        let meta = snapshot.meta;
+        let bytes = snapshot.snapshot.into_inner();
+        let mut target = HomeKvStateMachine::default();
+        target
+            .install_snapshot(&meta, Box::new(Cursor::new(bytes.clone())))
+            .await
+            .unwrap();
+        let mut corrupted = bytes;
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xff;
+        assert!(target
+            .install_snapshot(&meta, Box::new(Cursor::new(corrupted)))
+            .await
+            .is_err());
+
+        let target_metrics = target.snapshot_metrics();
+        assert_eq!(target_metrics.install_attempts, 2);
+        assert_eq!(target_metrics.installs_succeeded, 1);
+        assert_eq!(target_metrics.install_failures, 1);
+        assert_eq!(target_metrics.install_bytes, source_metrics.build_bytes);
+        assert_eq!(target_metrics.install_latency.observations, 2);
+        assert_eq!(
+            target_metrics
+                .install_latency
+                .bucket_counts
+                .iter()
+                .sum::<u64>(),
+            target_metrics.install_latency.observations
+        );
+        assert!(!serde_json::to_string(&target_metrics)
+            .unwrap()
+            .contains("openraft"));
+
+        let blocker = snapshot_path("metrics-blocker");
+        fs::create_dir_all(&blocker).unwrap();
+        let path = blocker.join("snapshot");
+        let mut failing = HomeKvStateMachine::open(&path).unwrap();
+        fs::remove_dir(&blocker).unwrap();
+        fs::write(&blocker, b"not-a-directory").unwrap();
+        assert!(failing
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .is_err());
+        let failure_metrics = failing.snapshot_metrics();
+        assert_eq!(failure_metrics.build_attempts, 1);
+        assert_eq!(failure_metrics.builds_succeeded, 0);
+        assert_eq!(failure_metrics.build_failures, 1);
+        assert_eq!(failure_metrics.build_bytes, 0);
+        assert_eq!(failure_metrics.build_latency.observations, 1);
+        fs::remove_file(blocker).unwrap();
+    }
+
 
 }
