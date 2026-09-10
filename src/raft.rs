@@ -3,7 +3,9 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot, SnapshotMeta};
 use openraft::{BasicNode, Entry, EntryPayload, LogId, OptionalSend, StorageError, StorageIOError, StoredMembership};
@@ -77,11 +79,159 @@ const SNAPSHOT_MAGIC: &[u8; 8] = b"HKVSNAP1";
 const SNAPSHOT_VERSION: u16 = 1;
 const M3_SHARD_ID: u64 = 0;
 const SNAPSHOT_HEADER_LEN: usize = 8 + 8 + 8;
+const APPLY_LATENCY_UPPER_BOUNDS_MICROS: [u64; 7] =
+    [10, 50, 100, 500, 1_000, 5_000, 25_000];
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApplyLatencyHistogramSnapshot {
+    pub upper_bounds_micros: [u64; 7],
+    /// Eight disjoint buckets: one for each upper bound and a final overflow bucket.
+    pub bucket_counts: [u64; 8],
+    pub observations: u64,
+    pub total_micros: u64,
+    pub max_micros: u64,
+}
+
+#[derive(Debug)]
+struct ApplyLatencyHistogram {
+    buckets: [AtomicU64; 8],
+    observations: AtomicU64,
+    total_micros: AtomicU64,
+    max_micros: AtomicU64,
+}
+
+impl Default for ApplyLatencyHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            observations: AtomicU64::new(0),
+            total_micros: AtomicU64::new(0),
+            max_micros: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ApplyLatencyHistogram {
+    fn record(&self, duration: Duration) {
+        let micros = duration.as_micros().min(u64::MAX as u128) as u64;
+        let bucket = APPLY_LATENCY_UPPER_BOUNDS_MICROS
+            .iter()
+            .position(|upper| micros <= *upper)
+            .unwrap_or(APPLY_LATENCY_UPPER_BOUNDS_MICROS.len());
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        self.observations.fetch_add(1, Ordering::Relaxed);
+        self.total_micros.fetch_add(micros, Ordering::Relaxed);
+        self.max_micros.fetch_max(micros, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ApplyLatencyHistogramSnapshot {
+        ApplyLatencyHistogramSnapshot {
+            upper_bounds_micros: APPLY_LATENCY_UPPER_BOUNDS_MICROS,
+            bucket_counts: std::array::from_fn(|index| {
+                self.buckets[index].load(Ordering::Relaxed)
+            }),
+            observations: self.observations.load(Ordering::Relaxed),
+            total_micros: self.total_micros.load(Ordering::Relaxed),
+            max_micros: self.max_micros.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StateMachineApplyMetricsSnapshot {
+    pub apply_calls: u64,
+    pub entries_seen: u64,
+    pub entries_applied: u64,
+    pub normal_entries: u64,
+    pub blank_entries: u64,
+    pub membership_entries: u64,
+    pub duplicate_entries: u64,
+    pub mutations_applied: u64,
+    pub apply_failures: u64,
+    pub apply_latency: ApplyLatencyHistogramSnapshot,
+}
+
+#[derive(Debug, Default)]
+struct StateMachineApplyMetricsInner {
+    apply_calls: AtomicU64,
+    entries_seen: AtomicU64,
+    entries_applied: AtomicU64,
+    normal_entries: AtomicU64,
+    blank_entries: AtomicU64,
+    membership_entries: AtomicU64,
+    duplicate_entries: AtomicU64,
+    mutations_applied: AtomicU64,
+    apply_failures: AtomicU64,
+    apply_latency: ApplyLatencyHistogram,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HomeKvStateMachineMetrics {
+    inner: Arc<StateMachineApplyMetricsInner>,
+}
+
+#[derive(Debug, Default)]
+struct ApplyObservation {
+    entries_seen: u64,
+    entries_applied: u64,
+    normal_entries: u64,
+    blank_entries: u64,
+    membership_entries: u64,
+    duplicate_entries: u64,
+    mutations_applied: u64,
+}
+
+impl HomeKvStateMachineMetrics {
+    fn record(&self, observation: &ApplyObservation, duration: Duration, failed: bool) {
+        self.inner.apply_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .entries_seen
+            .fetch_add(observation.entries_seen, Ordering::Relaxed);
+        self.inner
+            .entries_applied
+            .fetch_add(observation.entries_applied, Ordering::Relaxed);
+        self.inner
+            .normal_entries
+            .fetch_add(observation.normal_entries, Ordering::Relaxed);
+        self.inner
+            .blank_entries
+            .fetch_add(observation.blank_entries, Ordering::Relaxed);
+        self.inner
+            .membership_entries
+            .fetch_add(observation.membership_entries, Ordering::Relaxed);
+        self.inner
+            .duplicate_entries
+            .fetch_add(observation.duplicate_entries, Ordering::Relaxed);
+        self.inner
+            .mutations_applied
+            .fetch_add(observation.mutations_applied, Ordering::Relaxed);
+        if failed {
+            self.inner.apply_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.apply_latency.record(duration);
+    }
+
+    pub fn snapshot(&self) -> StateMachineApplyMetricsSnapshot {
+        StateMachineApplyMetricsSnapshot {
+            apply_calls: self.inner.apply_calls.load(Ordering::Relaxed),
+            entries_seen: self.inner.entries_seen.load(Ordering::Relaxed),
+            entries_applied: self.inner.entries_applied.load(Ordering::Relaxed),
+            normal_entries: self.inner.normal_entries.load(Ordering::Relaxed),
+            blank_entries: self.inner.blank_entries.load(Ordering::Relaxed),
+            membership_entries: self.inner.membership_entries.load(Ordering::Relaxed),
+            duplicate_entries: self.inner.duplicate_entries.load(Ordering::Relaxed),
+            mutations_applied: self.inner.mutations_applied.load(Ordering::Relaxed),
+            apply_failures: self.inner.apply_failures.load(Ordering::Relaxed),
+            apply_latency: self.inner.apply_latency.snapshot(),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct HomeKvStateMachine {
     inner: Arc<RwLock<StateMachineData>>,
     snapshot_path: Option<Arc<PathBuf>>,
+    metrics: HomeKvStateMachineMetrics,
 }
 
 impl Default for HomeKvStateMachine {
@@ -89,6 +239,7 @@ impl Default for HomeKvStateMachine {
         Self {
             inner: Arc::new(RwLock::new(StateMachineData::default())),
             snapshot_path: None,
+            metrics: HomeKvStateMachineMetrics::default(),
         }
     }
 }
@@ -113,6 +264,7 @@ impl HomeKvStateMachine {
         Ok(Self {
             inner: Arc::new(RwLock::new(state)),
             snapshot_path: Some(Arc::new(path)),
+            metrics: HomeKvStateMachineMetrics::default(),
         })
     }
 
@@ -122,6 +274,10 @@ impl HomeKvStateMachine {
     }
 
     pub async fn get(&self, key: &[u8]) -> Option<Vec<u8>> { self.inner.read().await.data.get(key).cloned() }
+
+    pub fn metrics(&self) -> StateMachineApplyMetricsSnapshot {
+        self.metrics.snapshot()
+    }
 
     fn storage_error(message: &'static str) -> StorageError<RaftNodeId> {
         let err = io::Error::new(io::ErrorKind::InvalidData, message);
@@ -241,22 +397,52 @@ impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
 
     async fn apply<I>(&mut self, entries: I) -> Result<Vec<RaftResponse>, StorageError<RaftNodeId>>
     where I: IntoIterator<Item = Entry<HomeKvRaftConfig>> + OptionalSend, I::IntoIter: OptionalSend {
-        let mut responses = Vec::new();
-        let mut state = self.inner.write().await;
-        for entry in entries {
-            if let Some(last) = state.last_applied {
-                if entry.log_id == last { responses.push(RaftResponse::Noop); continue; }
-                if entry.log_id.index <= last.index { return Err(Self::storage_error("state-machine apply order regressed")); }
+        let started = Instant::now();
+        let mut observation = ApplyObservation::default();
+        let result = async {
+            let mut responses = Vec::new();
+            let mut state = self.inner.write().await;
+            for entry in entries {
+                observation.entries_seen += 1;
+                if let Some(last) = state.last_applied {
+                    if entry.log_id == last {
+                        observation.duplicate_entries += 1;
+                        responses.push(RaftResponse::Noop);
+                        continue;
+                    }
+                    if entry.log_id.index <= last.index {
+                        return Err(Self::storage_error("state-machine apply order regressed"));
+                    }
+                }
+                let response = match entry.payload {
+                    EntryPayload::Blank => {
+                        observation.blank_entries += 1;
+                        RaftResponse::Noop
+                    }
+                    EntryPayload::Normal(command) => {
+                        observation.normal_entries += 1;
+                        Self::apply_command(&mut state, command)
+                    }
+                    EntryPayload::Membership(membership) => {
+                        observation.membership_entries += 1;
+                        state.membership =
+                            StoredMembership::new(Some(entry.log_id), membership);
+                        RaftResponse::Noop
+                    }
+                };
+                if let RaftResponse::Applied { mutations } = &response {
+                    observation.mutations_applied += u64::from(*mutations);
+                }
+                observation.entries_applied += 1;
+                state.last_applied = Some(entry.log_id);
+                responses.push(response);
             }
-            let response = match entry.payload {
-                EntryPayload::Blank => RaftResponse::Noop,
-                EntryPayload::Normal(command) => Self::apply_command(&mut state, command),
-                EntryPayload::Membership(membership) => { state.membership = StoredMembership::new(Some(entry.log_id), membership); RaftResponse::Noop }
-            };
-            state.last_applied = Some(entry.log_id);
-            responses.push(response);
+            Ok(responses)
         }
-        Ok(responses)
+        .await;
+        self.metrics
+            .record(&observation, started.elapsed(), result.is_err());
+        result
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder { HomeKvSnapshotBuilder { state_machine: self.clone() } }
@@ -415,4 +601,86 @@ mod tests {
         let mut cursor = snapshot.snapshot; let mut bytes = Vec::new(); cursor.read_to_end(&mut bytes).unwrap(); bytes.truncate(bytes.len() - 3);
         let mut target = HomeKvStateMachine::default(); assert!(target.install_snapshot(&meta, Box::new(Cursor::new(bytes))).await.is_err());
     }
+
+    #[tokio::test]
+    async fn apply_metrics_track_command_membership_duplicate_and_failure_transitions() {
+        let mut sm = HomeKvStateMachine::default();
+        let membership = Membership::new(
+            vec![BTreeSet::from([1, 2, 3])],
+            BTreeMap::<RaftNodeId, RaftNode>::new(),
+        );
+        sm.apply(vec![
+            normal(
+                1,
+                RaftCommand::Set {
+                    key: b"a".to_vec(),
+                    value: b"one".to_vec(),
+                },
+            ),
+            normal(
+                2,
+                RaftCommand::Batch {
+                    mutations: vec![
+                        RaftMutation::Set {
+                            key: b"b".to_vec(),
+                            value: b"two".to_vec(),
+                        },
+                        RaftMutation::Delete { key: b"a".to_vec() },
+                    ],
+                },
+            ),
+            Entry {
+                log_id: log_id(3),
+                payload: EntryPayload::Blank,
+            },
+            Entry {
+                log_id: log_id(4),
+                payload: EntryPayload::Membership(membership),
+            },
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(
+            sm.apply(vec![normal(
+                4,
+                RaftCommand::Delete { key: b"b".to_vec() },
+            )])
+            .await
+            .unwrap(),
+            vec![RaftResponse::Noop]
+        );
+        assert!(sm
+            .apply(vec![normal(
+                3,
+                RaftCommand::Delete { key: b"b".to_vec() },
+            )])
+            .await
+            .is_err());
+
+        let view = sm.view().await;
+        assert_eq!(view.last_applied, Some(log_id(4)));
+        assert_eq!(view.membership.log_id(), &Some(log_id(4)));
+        assert_eq!(view.data.get(b"b".as_slice()), Some(&b"two".to_vec()));
+
+        let metrics = sm.metrics();
+        assert_eq!(metrics.apply_calls, 3);
+        assert_eq!(metrics.entries_seen, 6);
+        assert_eq!(metrics.entries_applied, 4);
+        assert_eq!(metrics.normal_entries, 2);
+        assert_eq!(metrics.blank_entries, 1);
+        assert_eq!(metrics.membership_entries, 1);
+        assert_eq!(metrics.duplicate_entries, 1);
+        assert_eq!(metrics.mutations_applied, 3);
+        assert_eq!(metrics.apply_failures, 1);
+        assert_eq!(metrics.apply_latency.observations, 3);
+        assert_eq!(
+            metrics.apply_latency.bucket_counts.iter().sum::<u64>(),
+            metrics.apply_latency.observations
+        );
+        assert!(!serde_json::to_string(&metrics)
+            .unwrap()
+            .contains("openraft"));
+    }
+
 }
