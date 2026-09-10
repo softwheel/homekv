@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use homekv::raft::{HomeKvStateMachine, RaftCommand, RaftNode};
 use homekv::raft_network::HomeKvRaftNetworkFactory;
+use homekv::raft_observability::HomeKvReplicaObserver;
 use homekv::raft_storage::HomeKvRaftLogStore;
 use homekv::raft_transport::{BootstrapNode, TestLinkController, ThreeNodeBootstrap};
 use openraft::raft::Raft;
@@ -80,6 +81,7 @@ async fn healthy_quorum_elects_new_leader_and_preserves_acknowledged_state() {
     let mut nodes = BTreeMap::new();
     let mut stores = BTreeMap::new();
     let mut state_machines = BTreeMap::new();
+    let mut observers = BTreeMap::new();
     for id in 1..=3 {
         let store = HomeKvRaftLogStore::open(root.join(format!("node-{id}.raft"))).unwrap();
         let sm = HomeKvStateMachine::default();
@@ -92,6 +94,10 @@ async fn healthy_quorum_elects_new_leader_and_preserves_acknowledged_state() {
         )
         .await
         .unwrap();
+        observers.insert(
+            id,
+            HomeKvReplicaObserver::new(raft.clone(), store.clone(), sm.clone()),
+        );
         stores.insert(id, store.clone());
         state_machines.insert(id, sm);
         nodes.insert(id, raft);
@@ -112,6 +118,28 @@ async fn healthy_quorum_elects_new_leader_and_preserves_acknowledged_state() {
 
     let old_leader = support::authoritative_leader(&nodes, None).await;
 
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let observed = observers.values().all(|observer| {
+            let metrics = observer.leadership_metrics();
+            metrics.term_advances > 0
+                && metrics.leader_selections > 0
+                && metrics.leader_identity_changes > 0
+        });
+        if observed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "observers did not record the initial authoritative leader"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let initial_leadership: BTreeMap<_, _> = observers
+        .iter()
+        .map(|(id, observer)| (*id, observer.leadership_metrics()))
+        .collect();
+
     nodes
         .get(&old_leader)
         .unwrap()
@@ -130,6 +158,36 @@ async fn healthy_quorum_elects_new_leader_and_preserves_acknowledged_state() {
 
     let new_leader = support::authoritative_leader(&nodes, Some(old_leader)).await;
     assert_ne!(new_leader, old_leader);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let healthy_observed = observers
+            .iter()
+            .filter(|(id, _)| **id != old_leader)
+            .all(|(id, observer)| {
+                let current = observer.leadership_metrics();
+                let initial = initial_leadership[id];
+                current.term_advances > initial.term_advances
+                    && current.leader_selections > initial.leader_selections
+                    && current.leader_identity_changes > initial.leader_identity_changes
+            });
+        let new_leader_acquired = observers[&new_leader]
+            .leadership_metrics()
+            .local_leadership_acquisitions
+            > initial_leadership[&new_leader].local_leadership_acquisitions;
+        if healthy_observed && new_leader_acquired {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "healthy quorum did not expose the new election and leadership transition"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let leadership_json =
+        serde_json::to_string(&observers[&new_leader].leadership_metrics()).unwrap();
+    assert!(!leadership_json.contains("OpenRaft"));
+    assert!(!leadership_json.contains("ServerState"));
 
     assert_eq!(
         state_machines
@@ -264,6 +322,22 @@ async fn healthy_quorum_elects_new_leader_and_preserves_acknowledged_state() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "former leader did not converge after suffix reconciliation"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if observers[&old_leader]
+            .leadership_metrics()
+            .local_leadership_losses
+            > initial_leadership[&old_leader].local_leadership_losses
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "former leader did not expose loss of local leadership after healing"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
