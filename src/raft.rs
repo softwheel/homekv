@@ -456,7 +456,7 @@ pub struct HomeKvSnapshotBuilder { state_machine: HomeKvStateMachine }
 impl RaftSnapshotBuilder<HomeKvRaftConfig> for HomeKvSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<HomeKvRaftConfig>, StorageError<RaftNodeId>> {
         let started = Instant::now();
-        let result = async {
+        let result: Result<Snapshot<HomeKvRaftConfig>, StorageError<RaftNodeId>> = async {
             let mut state = self.state_machine.inner.write().await;
             let image = SnapshotImage {
                 format_version: SNAPSHOT_VERSION,
