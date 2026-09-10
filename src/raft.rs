@@ -430,8 +430,8 @@ impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
                         RaftResponse::Noop
                     }
                 };
-                if let RaftResponse::Applied { mutations } = response {
-                    observation.mutations_applied += u64::from(mutations);
+                if let RaftResponse::Applied { mutations } = &response {
+                    observation.mutations_applied += u64::from(*mutations);
                 }
                 observation.entries_applied += 1;
                 state.last_applied = Some(entry.log_id);
