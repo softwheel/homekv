@@ -1,5 +1,7 @@
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use openraft::raft::Raft;
 use openraft::storage::RaftLogStorage;
@@ -53,6 +55,41 @@ pub struct ReplicaMember {
     pub voter: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LeadershipMetricsSnapshot {
+    /// Monotonic sum of newly observed Raft terms.
+    pub term_advances: u64,
+    /// Times a non-empty leader identity different from the prior identity was observed.
+    pub leader_selections: u64,
+    /// Changes in the observed leader identity, including loss or discovery.
+    pub leader_identity_changes: u64,
+    pub local_leadership_acquisitions: u64,
+    pub local_leadership_losses: u64,
+}
+
+#[derive(Debug, Default)]
+struct LeadershipMetrics {
+    term_advances: AtomicU64,
+    leader_selections: AtomicU64,
+    leader_identity_changes: AtomicU64,
+    local_leadership_acquisitions: AtomicU64,
+    local_leadership_losses: AtomicU64,
+}
+
+impl LeadershipMetrics {
+    fn snapshot(&self) -> LeadershipMetricsSnapshot {
+        LeadershipMetricsSnapshot {
+            term_advances: self.term_advances.load(Ordering::Relaxed),
+            leader_selections: self.leader_selections.load(Ordering::Relaxed),
+            leader_identity_changes: self.leader_identity_changes.load(Ordering::Relaxed),
+            local_leadership_acquisitions: self
+                .local_leadership_acquisitions
+                .load(Ordering::Relaxed),
+            local_leadership_losses: self.local_leadership_losses.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ReplicaStatus {
     pub node_id: u64,
@@ -67,6 +104,7 @@ pub struct ReplicaStatus {
     pub membership: MembershipStatus,
     pub snapshot: Option<LogPosition>,
     pub purged: Option<LogPosition>,
+    pub leadership: LeadershipMetricsSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +127,7 @@ pub struct HomeKvReplicaObserver {
     raft: Raft<HomeKvRaftConfig>,
     log_store: HomeKvRaftLogStore,
     state_machine: HomeKvStateMachine,
+    leadership: Arc<LeadershipMetrics>,
 }
 
 impl HomeKvReplicaObserver {
@@ -97,11 +136,67 @@ impl HomeKvReplicaObserver {
         log_store: HomeKvRaftLogStore,
         state_machine: HomeKvStateMachine,
     ) -> Self {
+        let leadership = Arc::new(LeadershipMetrics::default());
+        let mut receiver = raft.metrics();
+        let initial = receiver.borrow().clone();
+        let mut prior_term = initial.current_term;
+        let mut prior_leader = initial.current_leader;
+        let mut prior_local_leader =
+            initial.state == ServerState::Leader && initial.current_leader == Some(initial.id);
+        drop(initial);
+
+        let tracked = leadership.clone();
+        tokio::spawn(async move {
+            while receiver.changed().await.is_ok() {
+                let (current_term, current_leader, local_leader) = {
+                    let metrics = receiver.borrow();
+                    (
+                        metrics.current_term,
+                        metrics.current_leader,
+                        metrics.state == ServerState::Leader
+                            && metrics.current_leader == Some(metrics.id),
+                    )
+                };
+                if current_term > prior_term {
+                    tracked
+                        .term_advances
+                        .fetch_add(current_term - prior_term, Ordering::Relaxed);
+                }
+                if current_leader != prior_leader {
+                    tracked
+                        .leader_identity_changes
+                        .fetch_add(1, Ordering::Relaxed);
+                    if current_leader.is_some() {
+                        tracked.leader_selections.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                if local_leader != prior_local_leader {
+                    if local_leader {
+                        tracked
+                            .local_leadership_acquisitions
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        tracked
+                            .local_leadership_losses
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                prior_term = current_term;
+                prior_leader = current_leader;
+                prior_local_leader = local_leader;
+            }
+        });
+
         Self {
             raft,
             log_store,
             state_machine,
+            leadership,
         }
+    }
+
+    pub fn leadership_metrics(&self) -> LeadershipMetricsSnapshot {
+        self.leadership.snapshot()
     }
 
     pub async fn snapshot(&self) -> Result<ReplicaStatus, ObserveError> {
@@ -160,6 +255,7 @@ impl HomeKvReplicaObserver {
             },
             snapshot: metrics.snapshot.map(LogPosition::from),
             purged: metrics.purged.map(LogPosition::from),
+            leadership: self.leadership.snapshot(),
         })
     }
 }
