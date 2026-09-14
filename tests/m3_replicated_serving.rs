@@ -314,12 +314,24 @@ async fn admitted_write_survives_transport_future_cancellation() {
         ))
         .await;
     assert_eq!(overloaded.status, Status::Overloaded);
+
+    // The same bounded Raft admission budget also gates strong reads. A read must
+    // not bypass the semaphore (or fall back to the leader's local state) while
+    // an admitted write is waiting for durable quorum completion.
+    let overloaded_read = handler
+        .handle(request(13, shard, RequestBody::Get { key: key.clone() }))
+        .await;
+    assert_eq!(overloaded_read.status, Status::Overloaded);
+    assert!(overloaded_read.body.is_empty());
+
     let saturated = handler.metrics();
     assert_eq!(saturated.admission_capacity, 1);
     assert_eq!(saturated.admission_current, 1);
     assert_eq!(saturated.admission_peak, 1);
-    assert_eq!(saturated.admission_rejections, 1);
-    assert_eq!(saturated.overload_responses, 1);
+    assert_eq!(saturated.admission_rejections, 2);
+    assert_eq!(saturated.overload_responses, 2);
+    assert_eq!(saturated.read_requests, 1);
+    assert_eq!(saturated.write_requests, 2);
 
     for peer in [1_u64, 2, 3].into_iter().filter(|id| *id != leader) {
         cluster.links.heal(leader, peer);
@@ -346,15 +358,15 @@ async fn admitted_write_survives_transport_future_cancellation() {
     assert_eq!(read.body, b"committed-after-cancel");
 
     let completed = handler.metrics();
-    assert_eq!(completed.read_requests, 1);
+    assert_eq!(completed.read_requests, 2);
     assert_eq!(completed.write_requests, 2);
     assert_eq!(completed.successful_reads, 1);
     assert_eq!(completed.successful_writes, 0);
-    assert_eq!(completed.overload_responses, 1);
+    assert_eq!(completed.overload_responses, 2);
     assert_eq!(completed.admission_capacity, 1);
     assert_eq!(completed.admission_current, 0);
     assert_eq!(completed.admission_peak, 1);
-    assert_eq!(completed.admission_rejections, 1);
+    assert_eq!(completed.admission_rejections, 2);
 
     cluster.stop().await;
 }
