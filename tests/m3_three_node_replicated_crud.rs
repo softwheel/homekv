@@ -155,10 +155,37 @@ async fn strong_get_barrier_is_leader_authoritative_and_observes_applied_write()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn isolated_old_leader_cannot_acknowledge_or_apply_a_minority_write() {
+async fn quorum_loss_cannot_acknowledge_a_write_or_serve_a_stale_strong_read() {
     let cluster = Cluster::start().await;
     let leader = cluster.leader().await;
+    cluster
+        .nodes
+        .get(&leader)
+        .unwrap()
+        .client_write(RaftCommand::Set {
+            key: b"committed-before-quorum-loss".to_vec(),
+            value: b"durable".to_vec(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        cluster
+            .state_machines
+            .get(&leader)
+            .unwrap()
+            .get(b"committed-before-quorum-loss")
+            .await,
+        Some(b"durable".to_vec())
+    );
+
     cluster.isolate(leader);
+
+    let strong_read = cluster.nodes.get(&leader).unwrap().ensure_linearizable();
+    let read_outcome = tokio::time::timeout(Duration::from_millis(750), strong_read).await;
+    assert!(
+        !matches!(read_outcome, Ok(Ok(_))),
+        "a quorum-lost node must not satisfy the strong-read barrier from local state"
+    );
 
     let write = cluster.nodes.get(&leader).unwrap().client_write(RaftCommand::Set {
         key: b"minority".to_vec(),
