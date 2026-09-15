@@ -41,23 +41,21 @@ jobs:
         run: |
           set -o pipefail
           cargo test --locked --verbose --no-fail-fast 2>&1 | tee target/verification/tests.log
+      - name: M3 RF=3 engineering benchmark
+        run: |
+          for run in 1 2 3; do
+            cargo run --release --locked --bin hkvm3bench --               --config benchmarks/configs/m3-rf3-engineering.json               --output "target/verification/m3-rf3-run-${run}.json"
+          done
       - name: M0 storage benchmark smoke
         run: |
-          cargo run --locked --bin hkvbench -- \
-            --config benchmarks/configs/smoke-storage.json \
-            --output target/hkvbench-smoke.json
+          cargo run --locked --bin hkvbench --             --config benchmarks/configs/smoke-storage.json             --output target/hkvbench-smoke.json
       - name: M0 storage memory accounting smoke
         run: |
-          cargo run --locked --bin hkvmem -- \
-            --config benchmarks/configs/smoke-storage.json \
-            --output target/hkvmem-storage-smoke.json
+          cargo run --locked --bin hkvmem --             --config benchmarks/configs/smoke-storage.json             --output target/hkvmem-storage-smoke.json
       - name: M0 server memory accounting smoke
         run: |
           cargo build --locked --bin homekv --bin hkvmem
-          target/debug/hkvmem \
-            --config benchmarks/configs/smoke-server.json \
-            --homekv-bin target/debug/homekv \
-            --output target/hkvmem-server-smoke.json
+          target/debug/hkvmem             --config benchmarks/configs/smoke-server.json             --homekv-bin target/debug/homekv             --output target/hkvmem-server-smoke.json
       - name: Retain verification evidence
         if: always()
         uses: actions/upload-artifact@v4
