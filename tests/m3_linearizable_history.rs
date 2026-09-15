@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use homekv::raft::{HomeKvRaftConfig, HomeKvStateMachine, RaftCommand, RaftNode};
 use homekv::raft_network::HomeKvRaftNetworkFactory;
 use homekv::raft_storage::HomeKvRaftLogStore;
-use homekv::raft_transport::{BootstrapNode, TestLinkController, ThreeNodeBootstrap};
+use homekv::raft_transport::{BootstrapNode, LinkRule, TestLinkController, ThreeNodeBootstrap};
 use openraft::raft::Raft;
 use openraft::{Config, ServerState};
 
@@ -46,6 +46,7 @@ struct Cluster {
     root: std::path::PathBuf,
     nodes: BTreeMap<u64, Raft<HomeKvRaftConfig>>,
     state_machines: BTreeMap<u64, HomeKvStateMachine>,
+    links: TestLinkController,
 }
 
 impl Cluster {
@@ -104,6 +105,7 @@ impl Cluster {
             root,
             nodes,
             state_machines,
+            links,
         }
     }
 
@@ -274,6 +276,92 @@ async fn concurrent_writes_and_strong_gets_admit_a_linearizable_history() {
         admits_linearization(&history),
         "concurrent write/strong-read history is not linearizable: {history:?}"
     );
+
+    cluster.stop().await;
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delayed_then_unavailable_follower_preserves_linearizable_quorum_progress() {
+    let cluster = Cluster::start().await;
+    let leader = cluster.leader().await;
+    let slow_follower = [1_u64, 2, 3]
+        .into_iter()
+        .find(|id| *id != leader)
+        .unwrap();
+
+    cluster.links.set_rule(
+        leader,
+        slow_follower,
+        LinkRule::Delay(Duration::from_millis(40)),
+    );
+
+    let raft = cluster.nodes[&leader].clone();
+    let sm = cluster.state_machines[&leader].clone();
+    let clock = Arc::new(AtomicU64::new(0));
+    let planned = [
+        PlannedOp::Write(b"delayed-v1"),
+        PlannedOp::Read,
+        PlannedOp::Write(b"delayed-v2"),
+        PlannedOp::Read,
+    ];
+    let mut tasks = Vec::new();
+    for op in planned {
+        tasks.push(tokio::spawn(execute(
+            op,
+            raft.clone(),
+            sm.clone(),
+            clock.clone(),
+        )));
+    }
+    let mut history = Vec::new();
+    for task in tasks {
+        history.push(task.await.unwrap());
+    }
+    history.sort_by_key(|op| op.invoke);
+    assert!(
+        admits_linearization(&history),
+        "slow-follower history is not linearizable: {history:?}"
+    );
+
+    for peer in [1_u64, 2, 3] {
+        if peer != slow_follower {
+            cluster.links.partition_bidirectional(slow_follower, peer);
+        }
+    }
+
+    raft.client_write(RaftCommand::Set {
+        key: b"one-follower-unavailable".to_vec(),
+        value: b"quorum-progress".to_vec(),
+    })
+    .await
+    .unwrap();
+    raft.ensure_linearizable().await.unwrap();
+    assert_eq!(
+        sm.get(b"one-follower-unavailable").await,
+        Some(b"quorum-progress".to_vec())
+    );
+
+    for peer in [1_u64, 2, 3] {
+        if peer != slow_follower {
+            cluster.links.heal_bidirectional(slow_follower, peer);
+        }
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if cluster.state_machines[&slow_follower]
+            .get(b"one-follower-unavailable")
+            .await
+            == Some(b"quorum-progress".to_vec())
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "healed follower did not converge to the quorum-committed state"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     cluster.stop().await;
 }
