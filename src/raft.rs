@@ -1,15 +1,18 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Cursor, Write};
+use std::io::{self, Cursor, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot, SnapshotMeta};
 use openraft::{BasicNode, Entry, EntryPayload, LogId, OptionalSend, StorageError, StorageIOError, StoredMembership};
 use serde_derive::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 use tokio::sync::RwLock;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -50,7 +53,74 @@ impl fmt::Display for RaftResponse {
     }
 }
 
-openraft::declare_raft_types!(pub HomeKvRaftConfig: D = RaftCommand, R = RaftResponse, NodeId = RaftNodeId, Node = RaftNode,);
+pub const DEFAULT_SNAPSHOT_RECEIVE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+pub struct HomeKvSnapshotData {
+    inner: Cursor<Vec<u8>>,
+    max_bytes: usize,
+    receive_metrics: Option<HomeKvStateMachineMetrics>,
+}
+
+impl HomeKvSnapshotData {
+    fn receiving(max_bytes: usize, metrics: HomeKvStateMachineMetrics) -> Self {
+        Self { inner: Cursor::new(Vec::new()), max_bytes, receive_metrics: Some(metrics) }
+    }
+    pub fn into_inner(self) -> Vec<u8> { self.inner.into_inner() }
+    pub fn len(&self) -> usize { self.inner.get_ref().len() }
+    pub fn is_empty(&self) -> bool { self.inner.get_ref().is_empty() }
+}
+
+impl From<Vec<u8>> for HomeKvSnapshotData {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self { max_bytes: bytes.len().max(1), inner: Cursor::new(bytes), receive_metrics: None }
+    }
+}
+
+impl AsyncRead for HomeKvSnapshotData {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for HomeKvSnapshotData {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let position = usize::try_from(this.inner.position()).unwrap_or(usize::MAX);
+        if buf.len() > this.max_bytes.saturating_sub(position) {
+            if let Some(metrics) = &this.receive_metrics { metrics.record_snapshot_receive_rejection(); }
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "snapshot receive capacity exceeded")));
+        }
+        let result = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(_)) = result {
+            if let Some(metrics) = &this.receive_metrics { metrics.record_snapshot_receive_progress(this.inner.get_ref().len()); }
+        }
+        result
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl AsyncSeek for HomeKvSnapshotData {
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        Pin::new(&mut self.get_mut().inner).start_seek(position)
+    }
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        Pin::new(&mut self.get_mut().inner).poll_complete(cx)
+    }
+}
+
+openraft::declare_raft_types!(
+    pub HomeKvRaftConfig:
+        D = RaftCommand,
+        R = RaftResponse,
+        NodeId = RaftNodeId,
+        Node = RaftNode,
+        SnapshotData = HomeKvSnapshotData,
+);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StateMachineView {
@@ -113,6 +183,9 @@ pub struct SnapshotMetricsSnapshot {
     pub installs_succeeded: u64,
     pub install_failures: u64,
     pub install_bytes: u64,
+    pub receive_capacity_bytes: usize,
+    pub receive_peak_bytes: u64,
+    pub receive_rejections: u64,
     pub build_latency: SnapshotLatencyHistogramSnapshot,
     pub install_latency: SnapshotLatencyHistogramSnapshot,
 }
@@ -188,6 +261,8 @@ struct StateMachineApplyMetricsInner {
     snapshot_installs_succeeded: AtomicU64,
     snapshot_install_failures: AtomicU64,
     snapshot_install_bytes: AtomicU64,
+    snapshot_receive_peak_bytes: AtomicU64,
+    snapshot_receive_rejections: AtomicU64,
     snapshot_build_latency: ApplyLatencyHistogram,
     snapshot_install_latency: ApplyLatencyHistogram,
 }
@@ -291,7 +366,15 @@ impl HomeKvStateMachineMetrics {
         self.inner.snapshot_install_latency.record(duration);
     }
 
-    pub fn snapshot_operations(&self) -> SnapshotMetricsSnapshot {
+    fn record_snapshot_receive_progress(&self, bytes: usize) {
+        self.inner.snapshot_receive_peak_bytes.fetch_max(bytes.min(u64::MAX as usize) as u64, Ordering::Relaxed);
+    }
+
+    fn record_snapshot_receive_rejection(&self) {
+        self.inner.snapshot_receive_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot_operations(&self, receive_capacity_bytes: usize) -> SnapshotMetricsSnapshot {
         SnapshotMetricsSnapshot {
             build_attempts: self.inner.snapshot_build_attempts.load(Ordering::Relaxed),
             builds_succeeded: self.inner.snapshot_builds_succeeded.load(Ordering::Relaxed),
@@ -301,6 +384,9 @@ impl HomeKvStateMachineMetrics {
             installs_succeeded: self.inner.snapshot_installs_succeeded.load(Ordering::Relaxed),
             install_failures: self.inner.snapshot_install_failures.load(Ordering::Relaxed),
             install_bytes: self.inner.snapshot_install_bytes.load(Ordering::Relaxed),
+            receive_capacity_bytes,
+            receive_peak_bytes: self.inner.snapshot_receive_peak_bytes.load(Ordering::Relaxed),
+            receive_rejections: self.inner.snapshot_receive_rejections.load(Ordering::Relaxed),
             build_latency: self.inner.snapshot_build_latency.snapshot(),
             install_latency: self.inner.snapshot_install_latency.snapshot(),
         }
@@ -311,6 +397,7 @@ impl HomeKvStateMachineMetrics {
 pub struct HomeKvStateMachine {
     inner: Arc<RwLock<StateMachineData>>,
     snapshot_path: Option<Arc<PathBuf>>,
+    snapshot_receive_limit_bytes: usize,
     metrics: HomeKvStateMachineMetrics,
 }
 
@@ -319,6 +406,7 @@ impl Default for HomeKvStateMachine {
         Self {
             inner: Arc::new(RwLock::new(StateMachineData::default())),
             snapshot_path: None,
+            snapshot_receive_limit_bytes: DEFAULT_SNAPSHOT_RECEIVE_LIMIT_BYTES,
             metrics: HomeKvStateMachineMetrics::default(),
         }
     }
@@ -326,6 +414,16 @@ impl Default for HomeKvStateMachine {
 
 impl HomeKvStateMachine {
     pub fn open(snapshot_path: impl AsRef<Path>) -> Result<Self, StorageError<RaftNodeId>> {
+        Self::open_with_snapshot_receive_limit(snapshot_path, DEFAULT_SNAPSHOT_RECEIVE_LIMIT_BYTES)
+    }
+
+    pub fn open_with_snapshot_receive_limit(
+        snapshot_path: impl AsRef<Path>,
+        snapshot_receive_limit_bytes: usize,
+    ) -> Result<Self, StorageError<RaftNodeId>> {
+        if snapshot_receive_limit_bytes == 0 {
+            return Err(Self::storage_error("snapshot receive limit must be above zero"));
+        }
         let path = snapshot_path.as_ref().to_path_buf();
         let state = match fs::read(&path) {
             Ok(bytes) => {
@@ -344,6 +442,7 @@ impl HomeKvStateMachine {
         Ok(Self {
             inner: Arc::new(RwLock::new(state)),
             snapshot_path: Some(Arc::new(path)),
+            snapshot_receive_limit_bytes,
             metrics: HomeKvStateMachineMetrics::default(),
         })
     }
@@ -360,7 +459,7 @@ impl HomeKvStateMachine {
     }
 
     pub fn snapshot_metrics(&self) -> SnapshotMetricsSnapshot {
-        self.metrics.snapshot_operations()
+        self.metrics.snapshot_operations(self.snapshot_receive_limit_bytes)
     }
 
     fn storage_error(message: &'static str) -> StorageError<RaftNodeId> {
@@ -469,12 +568,12 @@ impl RaftSnapshotBuilder<HomeKvRaftConfig> for HomeKvSnapshotBuilder {
             let bytes = HomeKvStateMachine::encode_snapshot(&image)?;
             self.state_machine.persist_snapshot(&bytes)?;
             state.current_snapshot = Some((meta.clone(), bytes.clone()));
-            Ok(Snapshot { meta, snapshot: Box::new(Cursor::new(bytes)) })
+            Ok(Snapshot { meta, snapshot: Box::new(HomeKvSnapshotData::from(bytes)) })
         }
         .await;
         let bytes = result
             .as_ref()
-            .map(|snapshot| snapshot.snapshot.get_ref().len() as u64)
+            .map(|snapshot| snapshot.snapshot.len() as u64)
             .unwrap_or(0);
         self.state_machine.metrics.record_snapshot_build(
             started.elapsed(),
@@ -546,7 +645,10 @@ impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder { HomeKvSnapshotBuilder { state_machine: self.clone() } }
 
     async fn begin_receiving_snapshot(&mut self) -> Result<Box<<HomeKvRaftConfig as openraft::RaftTypeConfig>::SnapshotData>, StorageError<RaftNodeId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+        Ok(Box::new(HomeKvSnapshotData::receiving(
+            self.snapshot_receive_limit_bytes,
+            self.metrics.clone(),
+        )))
     }
 
     async fn install_snapshot(&mut self, meta: &SnapshotMeta<RaftNodeId, RaftNode>, snapshot: Box<<HomeKvRaftConfig as openraft::RaftTypeConfig>::SnapshotData>) -> Result<(), StorageError<RaftNodeId>> {
@@ -575,7 +677,7 @@ impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<HomeKvRaftConfig>>, StorageError<RaftNodeId>> {
         let state = self.inner.read().await;
-        Ok(state.current_snapshot.as_ref().map(|(meta, bytes)| Snapshot { meta: meta.clone(), snapshot: Box::new(Cursor::new(bytes.clone())) }))
+        Ok(state.current_snapshot.as_ref().map(|(meta, bytes)| Snapshot { meta: meta.clone(), snapshot: Box::new(HomeKvSnapshotData::from(bytes.clone())) }))
     }
 }
 
