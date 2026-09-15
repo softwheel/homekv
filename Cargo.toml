@@ -53,3 +53,7 @@ path = "src/bin/hkvbench.rs"
 [[bin]]
 name = "hkvmem"
 path = "src/bin/hkvmem.rs"
+
+[[bin]]
+name = "hkvm3bench"
+path = "src/bin/hkvm3bench.rs"
