@@ -38,7 +38,7 @@ Spec 0001 becomes `Verified` only after its child specs are verified and the end
 | REQ-OPS-003 | bounded-queue overload/backpressure test |
 | REQ-LANG-001 | benchmark/ADR evidence before any Zig production hot-path adoption |
 | REQ-BENCH-AUTH-001/002 | public result bundle contains frozen dedicated-host/network metadata |
-| REQ-RAFT-001/002 | dependency/integration review confirms raft-rs core + HomeKV-owned WAL/transport/state machine |
+| REQ-RAFT-001/002 | dependency/integration review confirms exact OpenRaft pin + HomeKV-owned log/vote storage, transport, state machine and durability boundary |
 | REQ-SDD-001..005 | PR/spec history proves milestone boundaries and verification gates were followed |
 
 ## C1 — Deterministic state-machine tests

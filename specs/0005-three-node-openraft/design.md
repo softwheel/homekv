@@ -1,6 +1,6 @@
 # Spec 0005 — One-Shard Three-Node OpenRaft Design
 
-- Status: Accepted
+- Status: Verified
 - Requirements: `requirements.md`
 - Tracking issue: #38
 

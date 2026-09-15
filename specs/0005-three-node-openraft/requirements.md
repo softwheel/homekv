@@ -1,6 +1,6 @@
 # Spec 0005 — One-Shard Three-Node OpenRaft Requirements
 
-- Status: Accepted
+- Status: Verified
 - Parent: `specs/0001-homekv-v1/requirements.md`
 - Tracking issue: #38
 
