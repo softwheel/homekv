@@ -353,3 +353,126 @@ async fn restart_does_not_apply_durable_uncommitted_suffix() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restarted_former_leader_rejoins_under_current_consensus_authority() {
+    let root = unique_test_dir();
+    let config = config(true);
+    let links = TestLinkController::default();
+    let mut factories = BTreeMap::new();
+    let mut nodes = BTreeMap::new();
+    let mut state_machines = BTreeMap::new();
+    for id in 1..=3 {
+        let factory = HomeKvRaftNetworkFactory::new(id, bootstrap(), 16, links.clone()).unwrap();
+        let store = HomeKvRaftLogStore::open(root.join(format!("node-{id}.raft"))).unwrap();
+        let sm = HomeKvStateMachine::default();
+        let raft = bounded(
+            "initial former-leader test startup",
+            Raft::new(id, config.clone(), factory.clone(), store, sm.clone()),
+        )
+        .await
+        .unwrap();
+        factories.insert(id, factory);
+        state_machines.insert(id, sm);
+        nodes.insert(id, raft);
+    }
+    for factory in factories.values() {
+        for (id, raft) in &nodes {
+            factory
+                .register_handler(*id, Arc::new(raft.clone()))
+                .unwrap();
+        }
+    }
+    bounded("former-leader test bootstrap", nodes[&1].initialize(membership()))
+        .await
+        .unwrap();
+    let former_leader = support::authoritative_leader(&nodes, None).await;
+    bounded(
+        "write before leader restart",
+        nodes[&former_leader].client_write(set(b"before-leader-restart", b"committed")),
+    )
+    .await
+    .unwrap();
+    let before = state_machines[&former_leader].view().await;
+    for sm in state_machines.values() {
+        wait_for_state(sm, &before, "replication before leader shutdown").await;
+    }
+
+    for peer in 1..=3 {
+        if peer != former_leader {
+            links.partition_bidirectional(former_leader, peer);
+        }
+    }
+    let stopped = nodes.remove(&former_leader).unwrap();
+    bounded("former leader shutdown", stopped.shutdown())
+        .await
+        .unwrap();
+    drop(stopped);
+    state_machines.remove(&former_leader);
+
+    let current_leader = support::authoritative_leader(&nodes, Some(former_leader)).await;
+    bounded(
+        "surviving quorum write after leader shutdown",
+        nodes[&current_leader].client_write(set(b"after-leader-restart", b"current-authority")),
+    )
+    .await
+    .unwrap();
+    bounded(
+        "current leader linearizable barrier",
+        nodes[&current_leader].ensure_linearizable(),
+    )
+    .await
+    .unwrap();
+    let expected = state_machines[&current_leader].view().await;
+
+    let recovered = HomeKvStateMachine::default();
+    let restarted = bounded(
+        "former leader restart from disk",
+        Raft::new(
+            former_leader,
+            config.clone(),
+            factories[&former_leader].clone(),
+            HomeKvRaftLogStore::open(root.join(format!("node-{former_leader}.raft"))).unwrap(),
+            recovered.clone(),
+        ),
+    )
+    .await
+    .unwrap();
+    wait_for_state(&recovered, &before, "isolated former-leader durable replay").await;
+    assert_eq!(
+        recovered.get(b"after-leader-restart").await,
+        None,
+        "isolated restart must not invent state committed while the node was down"
+    );
+    for factory in factories.values() {
+        factory
+            .register_handler(former_leader, Arc::new(restarted.clone()))
+            .unwrap();
+    }
+    for peer in 1..=3 {
+        if peer != former_leader {
+            links.heal_bidirectional(former_leader, peer);
+        }
+    }
+    wait_for_state(
+        &recovered,
+        &expected,
+        "former leader catch-up under current consensus authority",
+    )
+    .await;
+    assert_eq!(
+        recovered.get(b"after-leader-restart").await,
+        Some(b"current-authority".to_vec())
+    );
+
+    bounded("restarted former leader shutdown", restarted.shutdown())
+        .await
+        .unwrap();
+    for raft in nodes.values() {
+        bounded("surviving cluster shutdown", raft.shutdown())
+            .await
+            .unwrap();
+    }
+    fs::remove_dir_all(root).unwrap();
+}
