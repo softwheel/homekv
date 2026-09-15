@@ -76,6 +76,12 @@ impl From<Vec<u8>> for HomeKvSnapshotData {
     }
 }
 
+impl io::Read for HomeKvSnapshotData {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        io::Read::read(&mut self.inner, buf)
+    }
+}
+
 impl AsyncRead for HomeKvSnapshotData {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
@@ -802,7 +808,7 @@ mod tests {
         let mut builder = source.get_snapshot_builder().await; let snapshot = builder.build_snapshot().await.unwrap(); let meta = snapshot.meta;
         let mut cursor = snapshot.snapshot; let mut bytes = Vec::new(); cursor.read_to_end(&mut bytes).unwrap(); let last = bytes.len() - 1; bytes[last] ^= 0xff;
         let mut target = HomeKvStateMachine::default(); target.apply(vec![normal(1, RaftCommand::Set { key: b"existing".to_vec(), value: b"safe".to_vec() })]).await.unwrap(); let before = target.view().await;
-        assert!(target.install_snapshot(&meta, Box::new(Cursor::new(bytes))).await.is_err()); assert_eq!(target.view().await, before);
+        assert!(target.install_snapshot(&meta, Box::new(HomeKvSnapshotData::from(bytes))).await.is_err()); assert_eq!(target.view().await, before);
     }
 
     #[tokio::test]
@@ -810,7 +816,7 @@ mod tests {
         let mut source = HomeKvStateMachine::default(); source.apply(vec![normal(1, RaftCommand::Set { key: b"a".to_vec(), value: b"one".to_vec() })]).await.unwrap();
         let mut builder = source.get_snapshot_builder().await; let snapshot = builder.build_snapshot().await.unwrap(); let meta = snapshot.meta;
         let mut cursor = snapshot.snapshot; let mut bytes = Vec::new(); cursor.read_to_end(&mut bytes).unwrap(); bytes.truncate(bytes.len() - 3);
-        let mut target = HomeKvStateMachine::default(); assert!(target.install_snapshot(&meta, Box::new(Cursor::new(bytes))).await.is_err());
+        let mut target = HomeKvStateMachine::default(); assert!(target.install_snapshot(&meta, Box::new(HomeKvSnapshotData::from(bytes))).await.is_err());
     }
 
     #[tokio::test]
@@ -924,14 +930,14 @@ mod tests {
         let bytes = snapshot.snapshot.into_inner();
         let mut target = HomeKvStateMachine::default();
         target
-            .install_snapshot(&meta, Box::new(Cursor::new(bytes.clone())))
+            .install_snapshot(&meta, Box::new(HomeKvSnapshotData::from(bytes.clone())))
             .await
             .unwrap();
         let mut corrupted = bytes;
         let last = corrupted.len() - 1;
         corrupted[last] ^= 0xff;
         assert!(target
-            .install_snapshot(&meta, Box::new(Cursor::new(corrupted)))
+            .install_snapshot(&meta, Box::new(HomeKvSnapshotData::from(corrupted)))
             .await
             .is_err());
 
