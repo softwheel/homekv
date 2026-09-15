@@ -128,9 +128,9 @@ impl Cluster {
         let config = Arc::new(
             Config {
                 cluster_name: "homekv-m3-rf3-benchmark".into(),
-                heartbeat_interval: 25,
-                election_timeout_min: 100,
-                election_timeout_max: 200,
+                heartbeat_interval: 50,
+                election_timeout_min: 500,
+                election_timeout_max: 1_000,
                 ..Default::default()
             }
             .validate()?,
@@ -188,8 +188,24 @@ impl Cluster {
                 .filter_map(|(_, metrics)| metrics.current_leader)
                 .collect();
             if leaders.len() == 1 && known == BTreeSet::from([leaders[0]]) {
-                self.nodes[&leaders[0]].ensure_linearizable().await?;
-                return Ok(leaders[0]);
+                let candidate = leaders[0];
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let settled: Vec<_> = self
+                    .nodes
+                    .iter()
+                    .map(|(id, raft)| (*id, raft.metrics().borrow().clone()))
+                    .collect();
+                let still_leader = settled.iter().any(|(id, metrics)| {
+                    *id == candidate && metrics.state == ServerState::Leader
+                });
+                let settled_known: BTreeSet<_> = settled
+                    .iter()
+                    .filter_map(|(_, metrics)| metrics.current_leader)
+                    .collect();
+                if still_leader && settled_known == BTreeSet::from([candidate]) {
+                    self.nodes[&candidate].ensure_linearizable().await?;
+                    return Ok(candidate);
+                }
             }
             if tokio::time::Instant::now() >= deadline {
                 bail!("three-node benchmark cluster did not converge: {snapshots:?}");
