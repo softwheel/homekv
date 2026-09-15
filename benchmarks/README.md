@@ -181,3 +181,39 @@ M0 is a single-node prototype baseline, not a distributed or strong-consistency 
 The latency/throughput bundle includes the git SHA, Rust version, OS/kernel, CPU, logical CPU count, host memory where available, benchmark-process RSS where available, workload parameters, attempted/successful operation counts, throughput, p50/p95/p99 latency, and failure counters.
 
 The BENCH-T4 bundle separately records isolated storage/server RSS deltas and approximate bytes/key with explicit measurement limitations.
+
+
+## M3 RF=3 engineering benchmark
+
+`hkvm3bench` exercises an in-process three-voter OpenRaft group through the same
+HomeKV-owned durable log, network adapter, state machine, and safe read barrier used
+by the retained M3 verification tests.
+
+The checked-in matrix uses 16-byte keys, 64-byte values, 128 preloaded keys,
+concurrency 1 and 8, and GET, SET, DELETE, and deterministic 80/20 read/write
+workloads. Every measured cell records 100 successful-operation latency samples
+when the zero-failure gate passes, including p50/p95/p99 and throughput.
+
+Run one engineering capture with:
+
+```bash
+cargo run --release --locked --bin hkvm3bench -- \
+  --config benchmarks/configs/m3-rf3-engineering.json \
+  --output target/verification/m3-rf3-run-1.json
+```
+
+The normal Rust workflow performs three complete runs on the same runner and retains
+all JSON bundles in its evidence artifact. A run fails if any operation fails.
+Result bundles explicitly record:
+
+- replication factor 3;
+- quorum-backed linearizable GET/read-mix operations;
+- quorum-durable plus leader-apply mutation completion;
+- exact HomeKV commit, pinned OpenRaft version, Rust toolchain, OS/kernel, CPU,
+  memory and filesystem metadata;
+- payload, dataset, concurrency, operation counts, throughput, p50/p95/p99 and
+  failures for every cell.
+
+DELETE targets deterministic absent keys, matching the preserved M0 cardinality
+discipline. The results are engineering/regression characterization only and set
+`authoritative_performance_result` to `false`; they are not public release claims.
