@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "mode": "engineering",
+  "seed": 1597463007,
+  "key_size": 16,
+  "value_size": 64,
+  "dataset_cardinality": 128,
+  "warmup_operations": 16,
+  "operations_per_cell": 100,
+  "concurrencies": [
+    1,
+    8
+  ],
+  "workloads": [
+    "get",
+    "set",
+    "delete",
+    "read80_write20"
+  ]
+}
