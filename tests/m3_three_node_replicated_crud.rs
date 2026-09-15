@@ -183,7 +183,7 @@ async fn quorum_loss_cannot_acknowledge_a_write_or_serve_a_stale_strong_read() {
     let strong_read = cluster.nodes.get(&leader).unwrap().ensure_linearizable();
     let read_outcome = tokio::time::timeout(Duration::from_millis(750), strong_read).await;
     assert!(
-        !matches!(read_outcome, Ok(Ok(()))),
+        !matches!(read_outcome, Ok(Ok(_))),
         "a quorum-lost node must not satisfy the strong-read barrier from local state"
     );
 
