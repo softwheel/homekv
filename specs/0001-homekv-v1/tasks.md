@@ -69,11 +69,11 @@ Specify and implement framing, pipelining, request IDs, redirects, bounds, backp
 
 ## T-0004 — M3 one correct replicated shard
 
-- Planned child spec: `0005-replicated-shard`
+- Child spec: `specs/0005-three-node-openraft/`
 - Requirements: `REQ-RAFT-*`, `REQ-CONS-*`, `REQ-DUR-*`, `REQ-FAIL-001/002/003/005`, `REQ-OPS-001`, `REQ-SDD-004`
 - Depends on: T-0002; M2 protocol may be integrated but is not a safety prerequisite
 
-Integrate TiKV `raft-rs` for a three-replica shard. Implement persistent Ready handling, durable WAL boundary, safe ReadIndex, deterministic apply, leader failover, basic snapshot/recovery, and fault tests sufficient to prove one group.
+Integrate pinned OpenRaft for a three-replica shard. Implement HomeKV-owned durable log/vote storage, quorum-backed linearizable reads, deterministic apply, leader failover, snapshot/recovery, bounded transport/admission, and fault tests sufficient to prove one group.
 
 ## T-0005 — M4 Multi-Raft placement and rebalancing
 
