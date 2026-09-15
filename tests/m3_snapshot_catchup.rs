@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::future::Future;
 use std::io::Read;
+
+use tokio::io::AsyncWriteExt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -288,7 +290,7 @@ async fn abandoned_or_corrupt_snapshot_receive_preserves_durable_state() {
     let before = target.view().await;
 
     let mut partial = target.begin_receiving_snapshot().await.unwrap();
-    partial.get_mut().extend_from_slice(b"partial-snapshot");
+    partial.write_all(b"partial-snapshot").await.unwrap();
     drop(partial);
     assert_eq!(target.view().await, before);
     drop(target);
@@ -320,7 +322,7 @@ async fn abandoned_or_corrupt_snapshot_receive_preserves_durable_state() {
     let mut reopened = HomeKvStateMachine::open(&target_path).unwrap();
     assert!(
         reopened
-            .install_snapshot(&meta, Box::new(std::io::Cursor::new(bytes)))
+            .install_snapshot(&meta, Box::new(homekv::raft::HomeKvSnapshotData::from(bytes)))
             .await
             .is_err()
     );
@@ -328,5 +330,33 @@ async fn abandoned_or_corrupt_snapshot_receive_preserves_durable_state() {
     drop(reopened);
     assert_eq!(HomeKvStateMachine::open(&target_path).unwrap().view().await, before);
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[tokio::test]
+async fn snapshot_reception_enforces_configured_memory_bound() {
+    let root = unique_test_dir("snapshot-receive-bound");
+    fs::create_dir_all(&root).unwrap();
+    let target_path = root.join("target.snapshot");
+    let mut target = HomeKvStateMachine::open_with_snapshot_receive_limit(&target_path, 32).unwrap();
+    let before = target.view().await;
+
+    let mut receiving = target.begin_receiving_snapshot().await.unwrap();
+    receiving.write_all(&[0x5a; 32]).await.unwrap();
+    assert_eq!(receiving.len(), 32);
+    assert!(receiving.write_all(&[0x5a]).await.is_err());
+    assert_eq!(receiving.len(), 32);
+
+    let saturated = target.snapshot_metrics();
+    assert_eq!(saturated.receive_capacity_bytes, 32);
+    assert_eq!(saturated.receive_peak_bytes, 32);
+    assert_eq!(saturated.receive_rejections, 1);
+
+    drop(receiving);
+    assert_eq!(target.view().await, before);
+    assert!(!target_path.exists());
+    drop(target);
+    assert_eq!(HomeKvStateMachine::open(&target_path).unwrap().view().await, before);
     fs::remove_dir_all(root).unwrap();
 }
