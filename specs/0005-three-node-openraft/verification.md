@@ -1,6 +1,6 @@
 # Spec 0005 — One-Shard Three-Node OpenRaft Verification
 
-- Status: Accepted verification plan; implementation not yet verified
+- Status: Verified
 - Requirements: `requirements.md`
 - Design: `design.md`
 - Tasks: `tasks.md`
@@ -34,21 +34,21 @@ The M3 verification record must capture:
 
 | Requirement | Required evidence | State |
 |---|---|---|
-| `REQ-M3-RAFT-001` | lockfile/dependency test shows exact OpenRaft 0.9.25 | Pending |
-| `REQ-M3-RAFT-002..003` | adapter boundary review + tests proving no direct strong mutation bypass | Pending |
-| `REQ-M3-SM-001..005` | deterministic apply/order/membership/applied-state unit + property tests | Pending |
-| `REQ-M3-WRITE-001..005` | replicated CRUD/batch, non-leader, minority, cancellation tests | Pending |
-| `REQ-M3-DUR-001` | vote crash/reopen and injected flush-failure tests | Pending |
-| `REQ-M3-DUR-002` | append readability + `LogFlushed` durability-order tests | Pending |
-| `REQ-M3-DUR-003..005` | truncate/purge/no-hole plus corruption/truncation/version tests | Pending |
-| `REQ-M3-DUR-006..007` | restart/replay model-state tests excluding uncommitted suffix | Pending |
-| `REQ-M3-READ-001..004` | safe-barrier integration + linearizable history checks + follower rejection | Pending |
-| `REQ-M3-MEM-001..004` | deterministic 3-voter bootstrap/repeat/incompatible-init tests | Pending |
-| `REQ-M3-NET-001..004` | RPC coverage, bounded queues and deterministic partition controls | Pending |
-| `REQ-M3-SNAP-001..005` | snapshot round-trip/install/catch-up/corruption/crash tests | Pending |
-| `REQ-M3-FAIL-001..004` | leader loss, old-leader isolation, quorum loss, restart tests | Pending |
-| `REQ-M3-OPS-001..003` | metrics/state assertions during role/failure/storage transitions | Pending |
-| `REQ-M3-PERF-001..003` | retained RF=3 durable/linearizable 3-run engineering benchmark | Pending |
+| `REQ-M3-RAFT-001` | lockfile/dependency test shows exact OpenRaft 0.9.25 | PASS |
+| `REQ-M3-RAFT-002..003` | adapter boundary review + tests proving no direct strong mutation bypass | PASS |
+| `REQ-M3-SM-001..005` | deterministic apply/order/membership/applied-state unit + property tests | PASS |
+| `REQ-M3-WRITE-001..005` | replicated CRUD/batch, non-leader, minority, cancellation tests | PASS |
+| `REQ-M3-DUR-001` | vote crash/reopen and injected flush-failure tests | PASS |
+| `REQ-M3-DUR-002` | append readability + `LogFlushed` durability-order tests | PASS |
+| `REQ-M3-DUR-003..005` | truncate/purge/no-hole plus corruption/truncation/version tests | PASS |
+| `REQ-M3-DUR-006..007` | restart/replay model-state tests excluding uncommitted suffix | PASS |
+| `REQ-M3-READ-001..004` | safe-barrier integration + linearizable history checks + follower rejection | PASS |
+| `REQ-M3-MEM-001..004` | deterministic 3-voter bootstrap/repeat/incompatible-init tests | PASS |
+| `REQ-M3-NET-001..004` | RPC coverage, bounded queues and deterministic partition controls | PASS |
+| `REQ-M3-SNAP-001..005` | snapshot round-trip/install/catch-up/corruption/crash tests | PASS |
+| `REQ-M3-FAIL-001..004` | leader loss, old-leader isolation, quorum loss, restart tests | PASS |
+| `REQ-M3-OPS-001..003` | metrics/state assertions during role/failure/storage transitions | PASS |
+| `REQ-M3-PERF-001..003` | retained RF=3 durable/linearizable 3-run engineering benchmark | PASS |
 
 ## 4. State-machine verification
 
@@ -213,53 +213,139 @@ Before the final verification PR:
 
 ## 14. Final M3 verification record
 
-### PR #52: retained-log restart verification slice
+### 14.1 Decision and exact implementation identity
 
-The following tests contribute partial M3-T5 evidence; they do not mark M3-T5
-complete or change this spec to Verified:
+**Decision: PASS. Spec 0005 is Verified.**
 
-- `restarted_replica_replays_committed_history_and_catches_up`: three voters,
-  acknowledged SET/overwrite/BATCH/DELETE history, a follower shut down with an
-  existing durable log, and a second write acknowledged by the surviving quorum.
-  The fresh state machine must first recover the exact pre-shutdown data,
-  membership and applied identity while both network directions remain isolated.
-  Only then are links restored to check full-map catch-up and applied progress.
-- `restart_does_not_apply_durable_uncommitted_suffix`: a deterministic follower
-  fixture receives committed-prefix and uncommitted-suffix entries through
-  OpenRaft AppendEntries. Reopening the file must prove that the suffix really
-  exists beyond the durable committed position. Fresh-state-machine recovery
-  must restore only the committed prefix, including membership/applied metadata.
-  This fixture is a recovery-safety test, not a simulated client quorum proof.
-- `healthy_quorum_elects_new_leader_and_preserves_acknowledged_state`: readiness
-  requires a successful real quorum read barrier within five seconds. Transient
-  not-leader/quorum errors may be retried; fatal errors fail immediately. An
-  explicit all-links partition verifies that a cached Leader role cannot satisfy
-  readiness without quorum, and healing must allow the same wait to complete.
+The exact implementation candidate was PR #68 head
+`6e9ac6991c7e4f09145db89b9a870ae3c57d367a` on base
+`bf515cf0d9e422a806bacd2eac59f9cef9f7161b`. Authoritative Rust workflow
+[35016295781](https://github.com/softwheel/homekv/actions/runs/35016295781)
+tested merge checkout `47a7d19534612d26a3c811e2c65c5946f40c44af`.
+PR #68 merged as `5e2155fbfbfe6672358bd5dd3347e6d08b0285da`.
+The tested checkout and merged commit have the same tree
+`bfeddca60bb4c6f24a9fd823e9343057bae115c7` and the same ordered parents,
+so the merged implementation is byte-for-byte the tested code tree.
 
-Scope mapping: retained-log cases contribute to DUR-006/007, FAIL-004 and
-acceptance item 5. Snapshot recovery (SNAP-004), former-leader conflicting suffix
-reconciliation, abrupt process loss, and the rest of the mandatory matrix remain
-separate work. Snapshot creation is explicitly disabled in the restart tests so
-peer snapshot repair cannot be mistaken for local log replay.
+Workflow 35016295781 passed the locked build, complete Rust test suite, three
+RF=3 benchmark runs, M0 storage benchmark smoke, M0 storage-memory accounting
+smoke, and M0 server-memory accounting smoke. Evidence artifact
+[10415324683](https://github.com/softwheel/homekv/actions/runs/35016295781/artifacts/10415324683)
+has digest
+`sha256:264f004c0aff847b9ad8a75c0b91c5a2b7b35384c6193a28577571ad5fae234f`.
 
-Historical diagnosis: Rust run 33368459304 failed in the existing leader-failover
-test's immediate read barrier with `QuorumNotEnough`; it did not execute the
-restart test. The original failure's exact timing cause was not established.
-The readiness change removes the unsupported assumption that observing Leader
-implies an immediately successful read barrier, without bypassing that barrier.
+### 14.2 Environment and semantic configuration
 
-The Rust workflow retains the tested checkout SHA, toolchain/host/filesystem,
-lockfile digest and OpenRaft resolution, full test output, and completed M0 smoke
-outputs in `rust-verification-<run-id>-<attempt>`. Use a passing complete run and
-the PR head/merge SHA mapping as evidence; skipped gates are not passes.
+- OpenRaft: exact `0.9.25`; Cargo.lock SHA-256
+  `0e251c98a3a3ce31eaf4c986d92909d37e884ca48ca3a16c5477fbc06015f7d8`.
+- Rust: `rustc 1.98.1 (48a229cea 2026-09-01)`,
+  `x86_64-unknown-linux-gnu`; Cargo 1.98.1.
+- Host: Linux 6.17.0-1022-azure, AMD EPYC 7763, 4 logical CPUs,
+  16,766,414,848 bytes memory, ext4 durable-test filesystem.
+- Topology: exactly three voters, node IDs 1/2/3, explicit loopback endpoints.
+- Benchmark Raft timing: 100 ms heartbeat, 5-10 s election window; per-peer
+  outstanding RPC capacity 64.
+- Verified resource bounds: foreground capacity-one saturation tests; per-peer
+  capacity-one saturation tests; snapshot receive default 64 MiB and a 32-byte
+  deterministic saturation fixture.
+- Semantics: RF=3, quorum-durable writes plus current-leader apply,
+  quorum-backed linearizable reads; no lease/follower strong-read shortcut.
+- Benchmark: seed 1597463007; 16-byte keys, 64-byte values, 128-key dataset,
+  16 warmups and 100 measured operations per cell; concurrency 1 and 8.
 
-M3-T7 will replace `Pending` states with PASS/FAIL and record:
+### 14.3 Requirement evidence
 
-- exact tested SHA;
-- PRs for T1–T6;
-- workflow run IDs and retained artifact IDs/digests;
-- requirement-specific test names/evidence;
-- three-run benchmark summary;
-- residual risks and explicitly deferred M4/M5 work.
+- **RAFT/SM:** `applies_commands_in_committed_order`,
+  `membership_entry_updates_metadata_only`,
+  `replay_is_deterministic_and_duplicate_identity_is_not_reapplied`,
+  `lower_log_index_fails_closed`, and
+  `factory_is_the_exact_openraft_0925_network_factory`.
+- **WRITE/READ:** `leader_client_write_replicates_set_delete_and_batch_to_all_voters`,
+  `strong_get_barrier_is_leader_authoritative_and_observes_applied_write`,
+  `compact_contract_routes_strong_operations_through_raft_authority`,
+  `admitted_write_survives_transport_future_cancellation`,
+  `concurrent_writes_and_strong_gets_admit_a_linearizable_history`, and
+  `quorum_loss_cannot_acknowledge_a_write_or_serve_a_stale_strong_read`.
+- **DURABILITY:** `vote_is_durable_before_save_returns`,
+  `log_and_committed_progress_survive_reopen`,
+  `truncate_and_purge_are_hole_free_across_reopen`,
+  `injected_persist_failure_never_advances_vote_or_log_state`,
+  `checksum_truncation_and_version_corruption_fail_closed`, and
+  `durable_append_helper_persists_before_return`.
+- **MEMBERSHIP/NETWORK:** exact-three/idempotent/incompatible bootstrap tests,
+  exact OpenRaft network-factory coverage, directional partition/drop/delay
+  controls, and bounded slow/unreachable-peer saturation.
+- **SNAPSHOT/RECOVERY:** coherent round trip, durable reopen plus subsequent log
+  replay, interrupted temp-file safety, corrupt/truncated fail-closed tests,
+  forced lagging-follower snapshot install plus later log replay, abandoned or
+  corrupt receive preservation, bounded receive rejection, committed-prefix
+  restart replay, and durable uncommitted-suffix exclusion.
+- **FAILURE MATRIX:** healthy quorum failover, isolated/minority leader write
+  rejection, quorum-loss read/write failure, delayed and unavailable follower
+  model-checked progress, heal convergence, former-leader conflicting-suffix
+  reconciliation, follower restart, and literal former-leader process
+  restart/rejoin.
+- **OPERABILITY/BOUNDS:** stable replica status plus client/admission, per-peer
+  RPC, storage, apply, snapshot, election and leadership metrics; deterministic
+  saturation/failure assertions cover every mandatory metric family.
+- **PERFORMANCE:** PR #68's three retained RF=3 bundles contain all eight required
+  workload/concurrency cells, p50/p95/p99, throughput, failures and exact
+  environment/semantic metadata. Aggregate: 2,400 attempted, 2,400 successful,
+  zero failures. Results are explicitly engineering-only and
+  `authoritative_performance_result=false`.
 
-Only then may the spec status change to **Verified** and issue #38 close.
+### 14.4 Engineering benchmark summary
+
+Ranges below span the three retained zero-failure runs.
+
+| Workload | Concurrency | Throughput ops/s | p50 ms | p95 ms | p99 ms |
+|---|---:|---:|---:|---:|---:|
+| GET | 1 | 63,968-70,658 | 0.012-0.014 | 0.023-0.025 | 0.030-0.035 |
+| GET | 8 | 163,976-215,358 | 0.029-0.037 | 0.052-0.061 | 0.064-0.069 |
+| SET | 1 | 337-397 | 2.490-2.937 | 2.811-3.434 | 3.046-3.760 |
+| SET | 8 | 723-821 | 9.680-10.532 | 10.769-12.300 | 10.779-12.413 |
+| DELETE | 1 | 335-378 | 2.636-2.969 | 2.948-3.349 | 3.036-3.559 |
+| DELETE | 8 | 714-744 | 10.610-11.087 | 12.365-13.609 | 12.399-13.615 |
+| 80/20 | 1 | 1,548-1,750 | 0.034-0.037 | 2.651-3.002 | 2.716-3.273 |
+| 80/20 | 8 | 2,554-2,974 | 1.087-1.886 | 8.639-8.863 | 9.198-11.281 |
+
+These are regression/engineering observations on a shared CI runner, not a
+release claim or external comparison.
+
+### 14.5 SDD/CI ledger
+
+| Slice | PRs | Authoritative Rust workflows |
+|---|---|---|
+| S0 | #39 | 33290290079 |
+| T1 | #40 | 33303926982 |
+| T2 | #41 | 33314215573 |
+| T3 | #42-#44 | 33316855535, 33319667942, 33322313510 |
+| T4 | #45-#49 | 33325197349, 33330871661, 33336467000, 33341876488, 33344510367 |
+| T5 | #50-#55 | 33353844266, 33360312059, 34318460750, 34377197112, 34395319532, 34401474538 |
+| T6 | #56-#68 | 34407129832, 34412365110, 34413150589, 34416938602, 34421512155, 34425591848, 34429361337, 34802584393, 34925299536, 34943441806, 34965003312, 34990282985, 35016295781 |
+
+Artifact retention was added during T5. Key retained artifacts are #52
+`10090962522`; #53 `10114398939`; #54 `10121305520`; #55
+`10123749219`; #56 `10125804314`; #58 `10128051596`; #59
+`10129470340`; #60 `10131092978`; #61 `10132563883`; #62
+`10133895267`; #63 `10331858692`; #64 `10379641461`; #65
+`10386650170`; #66 `10395037237`; #67 `10405481973`; and final
+#68 `10415324683`. The final artifact supersedes earlier partial evidence by
+retaining the complete suite and all preserved M0 gates on the exact final code
+tree.
+
+### 14.6 Residual risks and deferred work
+
+- M3 proves one shard and exactly three voters. M4 owns 1,024-group placement,
+  scheduling, membership changes, movement/rebalance and many-group cost.
+- M3 uses a correctness-first durable image. M5 owns segmented WAL, group
+  commit, reclamation and production recovery-time/storage optimization.
+- Long-running randomized histories, broader crash injection and exhaustive
+  distributed fault campaigns belong to M6.
+- TLS/authentication and production network deployment policy are outside M3.
+- Lease reads, relaxed durability and public comparative performance claims
+  remain forbidden unless a later accepted spec owns and verifies them.
+
+No residual item weakens or leaves unresolved a mandatory Spec 0005 requirement.
+Issue #38 may close after the verification PR merges. The v1 tracker proceeds to
+an accepted M4 child spec; Spec 0001 remains Accepted.
