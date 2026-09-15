@@ -128,9 +128,9 @@ impl Cluster {
         let config = Arc::new(
             Config {
                 cluster_name: "homekv-m3-rf3-benchmark".into(),
-                heartbeat_interval: 50,
-                election_timeout_min: 500,
-                election_timeout_max: 1_000,
+                heartbeat_interval: 100,
+                election_timeout_min: 5_000,
+                election_timeout_max: 10_000,
                 ..Default::default()
             }
             .validate()?,
@@ -170,7 +170,7 @@ impl Cluster {
     }
 
     async fn leader(&self) -> Result<u64> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let snapshots: Vec<_> = self
                 .nodes
@@ -370,7 +370,15 @@ async fn run_cell(
                 let started = Instant::now();
                 match perform_owned(&owned, &workload, start_index + offset, &raft, &sm).await {
                     Ok(()) => result.samples.push(nanos(started.elapsed())),
-                    Err(_) => result.failures += 1,
+                    Err(error) => {
+                        result.failures += 1;
+                        eprintln!(
+                            "benchmark operation failed: workload={} concurrency={} index={} error={error:#}",
+                            workload,
+                            concurrency,
+                            start_index + offset
+                        );
+                    }
                 }
             }
             result
