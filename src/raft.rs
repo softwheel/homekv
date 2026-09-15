@@ -91,7 +91,7 @@ impl AsyncWrite for HomeKvSnapshotData {
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "snapshot receive capacity exceeded")));
         }
         let result = Pin::new(&mut this.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(_)) = result {
+        if let Poll::Ready(Ok(_)) = &result {
             if let Some(metrics) = &this.receive_metrics { metrics.record_snapshot_receive_progress(this.inner.get_ref().len()); }
         }
         result
