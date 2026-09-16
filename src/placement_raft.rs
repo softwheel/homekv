@@ -9,7 +9,7 @@ use crate::raft::{HomeKvRaftConfig, HomeKvStateMachine, RaftCommand, RaftRespons
 
 const CATALOG_STATE_KEY: &[u8] = b"\0homekv/system/placement-catalog/v1";
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PlacementCatalogGroup {
     raft: Raft<HomeKvRaftConfig>,
     state_machine: HomeKvStateMachine,
