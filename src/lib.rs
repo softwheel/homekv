@@ -4,6 +4,7 @@ pub mod data_plane;
 pub mod data_plane_adapter;
 pub mod data_plane_runtime;
 pub mod group_registry;
+pub mod group_runtime;
 pub mod honey_bees;
 pub mod placement;
 pub mod placement_raft;
