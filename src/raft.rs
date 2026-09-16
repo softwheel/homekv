@@ -27,7 +27,7 @@ pub enum RaftCommand {
     Set { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
     Batch { mutations: Vec<RaftMutation> },
-
+    Initialize { key: Vec<u8>, value: Vec<u8> },
 }
 
 impl fmt::Display for RaftCommand {
@@ -36,12 +36,21 @@ impl fmt::Display for RaftCommand {
             Self::Set { key, value } => write!(f, "set({},{})", key.len(), value.len()),
             Self::Delete { key } => write!(f, "delete({})", key.len()),
             Self::Batch { mutations } => write!(f, "batch({})", mutations.len()),
+            Self::Initialize { key, value } => {
+                write!(f, "initialize({},{})", key.len(), value.len())
+            }
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub enum RaftResponse { Applied { mutations: u32 }, EmptyBatch, Noop }
+pub enum RaftResponse {
+    Applied { mutations: u32 },
+    EmptyBatch,
+    Noop,
+    AlreadyPresent,
+    Conflict,
+}
 
 impl fmt::Display for RaftResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -49,6 +58,8 @@ impl fmt::Display for RaftResponse {
             Self::Applied { mutations } => write!(f, "applied({mutations})"),
             Self::EmptyBatch => write!(f, "empty-batch"),
             Self::Noop => write!(f, "noop"),
+            Self::AlreadyPresent => write!(f, "already-present"),
+            Self::Conflict => write!(f, "conflict"),
         }
     }
 }
@@ -551,6 +562,14 @@ impl HomeKvStateMachine {
                 }
                 RaftResponse::Applied { mutations: mutations.len() as u32 }
             }
+            RaftCommand::Initialize { key, value } => match state.data.get(&key) {
+                None => {
+                    state.data.insert(key, value);
+                    RaftResponse::Applied { mutations: 1 }
+                }
+                Some(current) if current == &value => RaftResponse::AlreadyPresent,
+                Some(_) => RaftResponse::Conflict,
+            },
         }
     }
 }
@@ -730,6 +749,48 @@ mod tests {
     async fn lower_log_index_fails_closed() {
         let mut sm = HomeKvStateMachine::default(); sm.apply(vec![normal(2, RaftCommand::Set { key: b"k".to_vec(), value: b"v".to_vec() })]).await.unwrap(); let before = sm.view().await;
         assert!(sm.apply(vec![normal(1, RaftCommand::Delete { key: b"k".to_vec() })]).await.is_err()); assert_eq!(sm.view().await, before);
+    }
+
+    #[tokio::test]
+    async fn initialize_is_idempotent_and_rejects_conflicting_state() {
+        let mut sm = HomeKvStateMachine::default();
+        assert_eq!(
+            sm.apply(vec![normal(
+                1,
+                RaftCommand::Initialize {
+                    key: b"system".to_vec(),
+                    value: b"first".to_vec(),
+                },
+            )])
+            .await
+            .unwrap(),
+            vec![RaftResponse::Applied { mutations: 1 }]
+        );
+        assert_eq!(
+            sm.apply(vec![normal(
+                2,
+                RaftCommand::Initialize {
+                    key: b"system".to_vec(),
+                    value: b"first".to_vec(),
+                },
+            )])
+            .await
+            .unwrap(),
+            vec![RaftResponse::AlreadyPresent]
+        );
+        assert_eq!(
+            sm.apply(vec![normal(
+                3,
+                RaftCommand::Initialize {
+                    key: b"system".to_vec(),
+                    value: b"conflict".to_vec(),
+                },
+            )])
+            .await
+            .unwrap(),
+            vec![RaftResponse::Conflict]
+        );
+        assert_eq!(sm.get(b"system").await, Some(b"first".to_vec()));
     }
 
     #[tokio::test]
