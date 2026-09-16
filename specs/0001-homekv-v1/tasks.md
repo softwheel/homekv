@@ -77,7 +77,8 @@ Integrate pinned OpenRaft for a three-replica shard. Implement HomeKV-owned dura
 
 ## T-0005 — M4 Multi-Raft placement and rebalancing
 
-- Planned child spec: `0006-multi-raft-placement`
+- Child spec: `specs/0006-multi-raft-placement/`
+- GitHub issue: #70
 - Requirements: `REQ-SHARD-*`, `REQ-FAIL-004`, `REQ-OPS-001`, `REQ-SDD-005`
 - Depends on: T-0004
 
