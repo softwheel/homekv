@@ -490,14 +490,14 @@ fn build_initial_placements(
 
     let mut placements = BTreeMap::new();
     for shard_id in 0..LOGICAL_SHARD_COUNT {
-        let mut selected = Vec::with_capacity(3);
+        let mut selected: Vec<RaftNodeId> = Vec::with_capacity(3);
         let mut selected_domains = BTreeSet::new();
         for replica in 0..3usize {
             let anchor = (usize::from(shard_id) * 3 + replica) % node_ids.len();
             let candidate = node_ids
                 .iter()
                 .enumerate()
-                .filter(|(_, node_id)| !selected.contains(node_id))
+                .filter(|(_, node_id)| !selected.contains(*node_id))
                 .filter(|(_, node_id)| {
                     !require_distinct_domains
                         || !selected_domains.contains(
