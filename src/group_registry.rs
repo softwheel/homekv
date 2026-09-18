@@ -707,4 +707,92 @@ mod tests {
         .await;
         assert!(retried.was_recovered());
     }
+
+    #[tokio::test]
+    async fn multi_group_restart_recovery_is_isolated_and_recover_before_serve() {
+        let registry = GroupRegistry::new(config(3, 32)).unwrap();
+        let first = GroupKind::Data { shard_id: 30 };
+        let second = GroupKind::Data { shard_id: 31 };
+        let corrupt = GroupKind::Data { shard_id: 32 };
+
+        recover_value(&registry, first, 8, "first-v1").await;
+        recover_value(&registry, second, 8, "second-v1").await;
+        assert_eq!(registry.remove(first).unwrap(), RemovalOutcome::Removed);
+        assert_eq!(registry.remove(second).unwrap(), RemovalOutcome::Removed);
+        assert_eq!(registry.metrics().accounted_bytes, 0);
+
+        let worker = registry.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let first_restart = tokio::spawn(async move {
+            worker
+                .recover_or_get(first, 8, || async move {
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Ok("first-v2".to_owned())
+                })
+                .await
+        });
+
+        started_rx.await.unwrap();
+        assert!(registry.get(first).unwrap().is_none());
+        let during_first_restart = registry.metrics();
+        assert_eq!(during_first_restart.recovering_groups, 1);
+        assert_eq!(during_first_restart.ready_data_groups, 0);
+        assert_eq!(during_first_restart.accounted_bytes, 8);
+
+        let second_restart = recover_value(&registry, second, 8, "second-v2").await;
+        assert!(second_restart.was_recovered());
+        assert_eq!(second_restart.handle().as_str(), "second-v2");
+        assert_eq!(
+            registry
+                .get(second)
+                .unwrap()
+                .as_ref()
+                .map(|handle| handle.as_str()),
+            Some("second-v2")
+        );
+        assert!(registry.get(first).unwrap().is_none());
+
+        let failed = registry
+            .recover_or_get(corrupt, 8, || async {
+                Err("corrupt group snapshot".to_owned())
+            })
+            .await;
+        assert_eq!(
+            failed.unwrap_err(),
+            GroupRegistryError::RecoveryFailed {
+                group_id: 33,
+                message: "corrupt group snapshot".to_owned(),
+            }
+        );
+        assert!(registry.get(corrupt).unwrap().is_none());
+        assert_eq!(
+            registry
+                .get(second)
+                .unwrap()
+                .as_ref()
+                .map(|handle| handle.as_str()),
+            Some("second-v2")
+        );
+
+        release_tx.send(()).unwrap();
+        let first_restart = first_restart.await.unwrap().unwrap();
+        assert!(first_restart.was_recovered());
+        assert_eq!(first_restart.handle().as_str(), "first-v2");
+
+        let ready = registry.metrics();
+        assert_eq!(ready.recovering_groups, 0);
+        assert_eq!(ready.ready_data_groups, 2);
+        assert_eq!(ready.accounted_bytes, 16);
+        assert_eq!(ready.recovery_failures, 1);
+
+        assert_eq!(registry.remove(first).unwrap(), RemovalOutcome::Removed);
+        assert_eq!(registry.remove(second).unwrap(), RemovalOutcome::Removed);
+        let final_metrics = registry.metrics();
+        assert_eq!(final_metrics.ready_data_groups, 0);
+        assert_eq!(final_metrics.recovering_groups, 0);
+        assert_eq!(final_metrics.accounted_bytes, 0);
+    }
+
 }
