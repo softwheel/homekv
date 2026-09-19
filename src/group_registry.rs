@@ -5,6 +5,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_derive::{Deserialize, Serialize};
 
+use crate::group_admission::{
+    GroupAdmission, GroupAdmissionError, GroupAdmissionMetrics, GroupAdmissionPermit,
+    GroupAdmissionScope, PerGroupAdmissionConfig,
+};
 use crate::placement::{data_group_id, GroupId, PLACEMENT_CATALOG_GROUP_ID};
 use crate::storage::LOGICAL_SHARD_COUNT;
 
@@ -68,6 +72,8 @@ pub struct GroupRegistryMetrics {
     pub recovery_cancellations: u64,
     pub data_capacity_rejections: u64,
     pub memory_capacity_rejections: u64,
+    pub foreground_rejections: u64,
+    pub event_rejections: u64,
     pub removals: u64,
 }
 
@@ -97,20 +103,43 @@ pub enum RemovalOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GroupRegistryError {
-    InvalidDataGroupCapacity { configured: usize, maximum: usize },
+    InvalidDataGroupCapacity {
+        configured: usize,
+        maximum: usize,
+    },
     InvalidMemoryCapacity,
     InvalidQueueCapacity,
     InvalidAccountedBytes,
-    UnknownDataGroup { shard_id: u16 },
-    DataCapacityExceeded { capacity: usize },
+    UnknownDataGroup {
+        shard_id: u16,
+    },
+    GroupNotAdmitted {
+        group_id: GroupId,
+    },
+    ForegroundSaturated {
+        group_id: GroupId,
+    },
+    EventSaturated {
+        group_id: GroupId,
+    },
+    DataCapacityExceeded {
+        capacity: usize,
+    },
     MemoryCapacityExceeded {
         capacity_bytes: usize,
         accounted_bytes: usize,
         requested_bytes: usize,
     },
-    RecoveryInProgress { group_id: GroupId },
-    RecoveryFailed { group_id: GroupId, message: String },
-    InternalInvariant { group_id: GroupId },
+    RecoveryInProgress {
+        group_id: GroupId,
+    },
+    RecoveryFailed {
+        group_id: GroupId,
+        message: String,
+    },
+    InternalInvariant {
+        group_id: GroupId,
+    },
 }
 
 impl fmt::Display for GroupRegistryError {
@@ -133,6 +162,17 @@ impl fmt::Display for GroupRegistryError {
             Self::UnknownDataGroup { shard_id } => {
                 write!(f, "data group for logical shard {shard_id} does not exist")
             }
+            Self::GroupNotAdmitted { group_id } => {
+                write!(f, "group {group_id} is not admitted to the registry")
+            }
+            Self::ForegroundSaturated { group_id } => write!(
+                f,
+                "per-group foreground admission is saturated for group {group_id}"
+            ),
+            Self::EventSaturated { group_id } => write!(
+                f,
+                "per-group event admission is saturated for group {group_id}"
+            ),
             Self::DataCapacityExceeded { capacity } => {
                 write!(f, "data-group capacity {capacity} is exhausted")
             }
@@ -173,6 +213,7 @@ impl<T> Clone for GroupRegistry<T> {
 
 struct RegistryInner<T> {
     config: GroupRegistryConfig,
+    admission: GroupAdmission,
     state: Mutex<RegistryState<T>>,
 }
 
@@ -255,9 +296,16 @@ where
 {
     pub fn new(config: GroupRegistryConfig) -> Result<Self, GroupRegistryError> {
         let config = config.validate()?;
+        // The registry validates the same capacities above, so this cannot fail.
+        let admission = GroupAdmission::new(PerGroupAdmissionConfig {
+            per_group_foreground_capacity: config.per_group_foreground_capacity,
+            per_group_event_capacity: config.per_group_event_capacity,
+        })
+        .map_err(|_| GroupRegistryError::InvalidQueueCapacity)?;
         Ok(Self {
             inner: Arc::new(RegistryInner {
                 config,
+                admission,
                 state: Mutex::new(RegistryState {
                     entries: BTreeMap::new(),
                     accounted_bytes: 0,
@@ -339,8 +387,7 @@ where
             let reservation_id = state.next_reservation_id;
             state.next_reservation_id = state.next_reservation_id.wrapping_add(1).max(1);
             state.accounted_bytes = next_accounted.expect("checked above");
-            state.counters.recovery_attempts =
-                state.counters.recovery_attempts.saturating_add(1);
+            state.counters.recovery_attempts = state.counters.recovery_attempts.saturating_add(1);
             state.entries.insert(
                 group_id,
                 RegistryEntry::Recovering {
@@ -392,8 +439,7 @@ where
                 handle: Arc::clone(&recovered),
             },
         );
-        state.counters.recovery_successes =
-            state.counters.recovery_successes.saturating_add(1);
+        state.counters.recovery_successes = state.counters.recovery_successes.saturating_add(1);
         reservation.active = false;
         Ok(RegistryAdmission::Recovered(recovered))
     }
@@ -409,6 +455,66 @@ where
             }) if *current_kind == kind => Some(Arc::clone(handle)),
             _ => None,
         })
+    }
+
+    /// Admit one in-flight foreground operation for an admitted group.
+    ///
+    /// The returned permit holds one of the group's
+    /// `per_group_foreground_capacity` slots; dropping it releases the slot.
+    /// Unknown, recovering, or removed groups fail closed, and a saturated
+    /// group fails with an explicit `ForegroundSaturated` error without
+    /// affecting other groups.
+    pub fn admit_foreground(
+        &self,
+        kind: GroupKind,
+    ) -> Result<GroupAdmissionPermit, GroupRegistryError> {
+        self.admit_scoped(kind, GroupAdmissionScope::Foreground)
+    }
+
+    /// Admit one in-flight group event for an admitted group.
+    ///
+    /// Same fail-closed and per-group isolation semantics as
+    /// [`GroupRegistry::admit_foreground`], against the
+    /// `per_group_event_capacity` bound.
+    pub fn admit_event(&self, kind: GroupKind) -> Result<GroupAdmissionPermit, GroupRegistryError> {
+        self.admit_scoped(kind, GroupAdmissionScope::Event)
+    }
+
+    fn admit_scoped(
+        &self,
+        kind: GroupKind,
+        scope: GroupAdmissionScope,
+    ) -> Result<GroupAdmissionPermit, GroupRegistryError> {
+        let group_id = kind.group_id()?;
+        {
+            let state = lock_state(&self.inner.state);
+            match state.entries.get(&group_id) {
+                Some(RegistryEntry::Ready {
+                    kind: current_kind, ..
+                }) if *current_kind == kind => {}
+                _ => return Err(GroupRegistryError::GroupNotAdmitted { group_id }),
+            }
+        }
+        self.inner
+            .admission
+            .try_admit(scope, group_id)
+            .map_err(|error| match error {
+                GroupAdmissionError::Saturated { group_id, scope } => match scope {
+                    GroupAdmissionScope::Foreground => {
+                        GroupRegistryError::ForegroundSaturated { group_id }
+                    }
+                    GroupAdmissionScope::Event => GroupRegistryError::EventSaturated { group_id },
+                },
+                GroupAdmissionError::InvalidForegroundCapacity
+                | GroupAdmissionError::InvalidEventCapacity => {
+                    unreachable!("registry validates admission capacities at construction")
+                }
+            })
+    }
+
+    /// Per-group foreground/event admission metrics.
+    pub fn admission_metrics(&self) -> Vec<GroupAdmissionMetrics> {
+        self.inner.admission.metrics()
     }
 
     pub fn remove(&self, kind: GroupKind) -> Result<RemovalOutcome, GroupRegistryError> {
@@ -427,10 +533,11 @@ where
                     accounted_bytes, ..
                 }) = state.entries.remove(&group_id)
                 {
-                    state.accounted_bytes =
-                        state.accounted_bytes.saturating_sub(accounted_bytes);
+                    state.accounted_bytes = state.accounted_bytes.saturating_sub(accounted_bytes);
                 }
                 state.counters.removals = state.counters.removals.saturating_add(1);
+                drop(state);
+                self.inner.admission.reset_group(group_id);
                 Ok(RemovalOutcome::Removed)
             }
         }
@@ -469,13 +576,23 @@ where
             recovery_cancellations: state.counters.recovery_cancellations,
             data_capacity_rejections: state.counters.data_capacity_rejections,
             memory_capacity_rejections: state.counters.memory_capacity_rejections,
+            foreground_rejections: self
+                .inner
+                .admission
+                .total_rejections(GroupAdmissionScope::Foreground),
+            event_rejections: self
+                .inner
+                .admission
+                .total_rejections(GroupAdmissionScope::Event),
             removals: state.counters.removals,
         }
     }
 }
 
 fn lock_state<T>(mutex: &Mutex<RegistryState<T>>) -> MutexGuard<'_, RegistryState<T>> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -613,7 +730,9 @@ mod tests {
         let registry = GroupRegistry::new(config(1, 8)).unwrap();
         let kind = GroupKind::Data { shard_id: 9 };
         let failed = registry
-            .recover_or_get(kind, 8, || async { Err("corrupt durable state".to_owned()) })
+            .recover_or_get(kind, 8, || async {
+                Err("corrupt durable state".to_owned())
+            })
             .await;
         assert_eq!(
             failed.unwrap_err(),
@@ -698,13 +817,8 @@ mod tests {
         assert_eq!(metrics.recovering_groups, 0);
         assert_eq!(metrics.accounted_bytes, 0);
         assert_eq!(metrics.recovery_cancellations, 1);
-        let retried = recover_value(
-            &registry,
-            GroupKind::Data { shard_id: 20 },
-            8,
-            "retried",
-        )
-        .await;
+        let retried =
+            recover_value(&registry, GroupKind::Data { shard_id: 20 }, 8, "retried").await;
         assert!(retried.was_recovered());
     }
 
@@ -795,4 +909,111 @@ mod tests {
         assert_eq!(final_metrics.accounted_bytes, 0);
     }
 
+    fn tight_admission_config() -> GroupRegistryConfig {
+        GroupRegistryConfig {
+            data_group_capacity: 2,
+            memory_capacity_bytes: 32,
+            per_group_event_capacity: 1,
+            per_group_foreground_capacity: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_and_event_admission_fail_closed_for_unadmitted_groups() {
+        let registry = GroupRegistry::<String>::new(tight_admission_config()).unwrap();
+        let hot = GroupKind::Data { shard_id: 40 };
+        assert_eq!(
+            registry.admit_foreground(hot).unwrap_err(),
+            GroupRegistryError::GroupNotAdmitted { group_id: 41 }
+        );
+        assert_eq!(
+            registry.admit_event(hot).unwrap_err(),
+            GroupRegistryError::GroupNotAdmitted { group_id: 41 }
+        );
+
+        recover_value(&registry, hot, 8, "hot").await;
+        let _foreground = registry.admit_foreground(hot).unwrap();
+        let _event = registry.admit_event(hot).unwrap();
+        assert_eq!(
+            registry.admit_foreground(hot).unwrap_err(),
+            GroupRegistryError::ForegroundSaturated { group_id: 41 }
+        );
+        assert_eq!(
+            registry.admit_event(hot).unwrap_err(),
+            GroupRegistryError::EventSaturated { group_id: 41 }
+        );
+
+        let metrics = registry.metrics();
+        assert_eq!(metrics.foreground_rejections, 1);
+        assert_eq!(metrics.event_rejections, 1);
+        let admission = registry.admission_metrics();
+        assert_eq!(admission.len(), 1);
+        assert_eq!(admission[0].group_id, 41);
+        assert_eq!(admission[0].foreground.inflight, 1);
+        assert_eq!(admission[0].foreground.rejections, 1);
+        assert_eq!(admission[0].event.inflight, 1);
+        serde_json::to_string(&metrics).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saturated_group_does_not_block_an_unrelated_healthy_group() {
+        let registry = GroupRegistry::<String>::new(tight_admission_config()).unwrap();
+        let hot = GroupKind::Data { shard_id: 50 };
+        let healthy = GroupKind::Data { shard_id: 51 };
+        recover_value(&registry, hot, 8, "hot").await;
+        recover_value(&registry, healthy, 8, "healthy").await;
+
+        let _hot_foreground = registry.admit_foreground(hot).unwrap();
+        let _hot_event = registry.admit_event(hot).unwrap();
+        assert!(matches!(
+            registry.admit_foreground(hot).unwrap_err(),
+            GroupRegistryError::ForegroundSaturated { .. }
+        ));
+        assert!(matches!(
+            registry.admit_event(hot).unwrap_err(),
+            GroupRegistryError::EventSaturated { .. }
+        ));
+
+        // The healthy group admits both scopes while the hot group is saturated.
+        let _healthy_foreground = registry.admit_foreground(healthy).unwrap();
+        let _healthy_event = registry.admit_event(healthy).unwrap();
+        let admission = registry.admission_metrics();
+        assert_eq!(admission.len(), 2);
+        let healthy_metrics = admission
+            .iter()
+            .find(|metrics| metrics.group_id == 52)
+            .unwrap();
+        assert_eq!(healthy_metrics.foreground.inflight, 1);
+        assert_eq!(healthy_metrics.event.inflight, 1);
+        assert_eq!(healthy_metrics.foreground.rejections, 0);
+        assert_eq!(registry.metrics().foreground_rejections, 1);
+    }
+
+    #[tokio::test]
+    async fn remove_resets_admission_state_for_readmission() {
+        let registry = GroupRegistry::<String>::new(tight_admission_config()).unwrap();
+        let kind = GroupKind::Data { shard_id: 60 };
+        recover_value(&registry, kind, 8, "v1").await;
+        let _permit = registry.admit_foreground(kind).unwrap();
+        assert!(matches!(
+            registry.admit_foreground(kind).unwrap_err(),
+            GroupRegistryError::ForegroundSaturated { .. }
+        ));
+        assert_eq!(registry.remove(kind).unwrap(), RemovalOutcome::Removed);
+        // Admission for a removed group fails closed, and the old saturation is gone.
+        assert_eq!(
+            registry.admit_foreground(kind).unwrap_err(),
+            GroupRegistryError::GroupNotAdmitted { group_id: 61 }
+        );
+        assert!(registry.admission_metrics().is_empty());
+        assert_eq!(registry.metrics().foreground_rejections, 0);
+
+        recover_value(&registry, kind, 8, "v2").await;
+        let _permit = registry.admit_foreground(kind).unwrap();
+        assert!(matches!(
+            registry.admit_foreground(kind).unwrap_err(),
+            GroupRegistryError::ForegroundSaturated { .. }
+        ));
+        assert_eq!(registry.metrics().foreground_rejections, 1);
+    }
 }
