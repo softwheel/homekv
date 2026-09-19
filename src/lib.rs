@@ -7,6 +7,7 @@ pub mod group_registry;
 pub mod group_runtime;
 pub mod group_transport;
 pub mod honey_bees;
+pub mod movement_admission;
 pub mod placement;
 pub mod placement_raft;
 pub mod raft;
