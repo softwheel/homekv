@@ -26,6 +26,11 @@ jobs:
         run: |
           cargo build --all-targets
           cargo test --all-targets
+      - name: Build release server binary
+        # The server below is backgrounded and the readiness wait only allows
+        # 60s: pre-build the release binary so `cargo run --release` starts it
+        # immediately instead of racing a cold release compile.
+        run: cargo build --release --bin homekv
       - name: Start shared local HomeKV server
         run: |
           cargo run --release --bin homekv -- \

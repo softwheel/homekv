@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atomic_counter::{AtomicCounter, RelaxedCounter};
-use structopt::StructOpt;
+use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tonic::transport::Server;
@@ -163,50 +163,51 @@ impl HomeKvService for HomeKvServer {
     }
 }
 
-#[derive(Debug, StructOpt)]
-#[structopt(
+#[derive(Debug, Parser)]
+#[command(
     name = "HOMEKV Server",
+    version,
     about = "Highly Optimized Memory Efficient KV Store"
 )]
 struct Opt {
     // Defines the server host
-    #[structopt(long = "host", default_value = "127.0.0.1")]
+    #[arg(long = "host", default_value = "127.0.0.1")]
     host: String,
     // Defines the server port
-    #[structopt(long = "port", default_value = "20001")]
+    #[arg(long = "port", default_value = "20001")]
     port: u32,
     // Defines the compact data-plane bind host.
-    #[structopt(long = "compact_host", default_value = "127.0.0.1")]
+    #[arg(long = "compact_host", default_value = "127.0.0.1")]
     compact_host: String,
     // Defines the compact data-plane port.
-    #[structopt(long = "compact_port", default_value = "20003")]
+    #[arg(long = "compact_port", default_value = "20003")]
     compact_port: u32,
-    #[structopt(long = "compact_max_frame", default_value = "8388608")]
+    #[arg(long = "compact_max_frame", default_value = "8388608")]
     compact_max_frame: usize,
-    #[structopt(long = "compact_max_key", default_value = "65536")]
+    #[arg(long = "compact_max_key", default_value = "65536")]
     compact_max_key: usize,
-    #[structopt(long = "compact_max_value", default_value = "4194304")]
+    #[arg(long = "compact_max_value", default_value = "4194304")]
     compact_max_value: usize,
-    #[structopt(long = "compact_max_batch_mutations", default_value = "1024")]
+    #[arg(long = "compact_max_batch_mutations", default_value = "1024")]
     compact_max_batch_mutations: usize,
-    #[structopt(long = "compact_max_batch_payload", default_value = "8388608")]
+    #[arg(long = "compact_max_batch_payload", default_value = "8388608")]
     compact_max_batch_payload: usize,
-    #[structopt(long = "compact_max_in_flight", default_value = "256")]
+    #[arg(long = "compact_max_in_flight", default_value = "256")]
     compact_max_in_flight: usize,
-    #[structopt(long = "compact_response_queue_capacity", default_value = "256")]
+    #[arg(long = "compact_response_queue_capacity", default_value = "256")]
     compact_response_queue_capacity: usize,
     // Defines the public host, which other servers will use to
     // reach to this server.
-    #[structopt(long = "public_host")]
+    #[arg(long = "public_host")]
     public_host: String,
     // Defines the gossip port
-    #[structopt(long = "gossip_port", default_value = "20002")]
+    #[arg(long = "gossip_port", default_value = "20002")]
     gossip_port: u32,
     // Defines the seed nodes list for gossip
-    #[structopt(long = "gossip_seeds", default_value = "")]
+    #[arg(long = "gossip_seeds", default_value = "")]
     gossip_seeds: Vec<String>,
     // Defines the gossip sync interval
-    #[structopt(long = "gossip_interval", default_value = "500")]
+    #[arg(long = "gossip_interval", default_value = "500")]
     gossip_interval: u64,
 }
 
@@ -236,7 +237,7 @@ fn compact_limits(opt: &Opt) -> Result<(CodecLimits, RuntimeLimits), Box<dyn std
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
     let server_addr = format!("{}:{}", opt.host, opt.port).parse()?;
     let compact_addr: std::net::SocketAddr =
         format!("{}:{}", opt.compact_host, opt.compact_port).parse()?;
