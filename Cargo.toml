@@ -57,3 +57,10 @@ path = "src/bin/hkvmem.rs"
 [[bin]]
 name = "hkvm3bench"
 path = "src/bin/hkvm3bench.rs"
+
+# Faster local iteration: keep line tables for useful backtraces, but skip
+# full debuginfo (variable inspection) in dev/test builds. This speeds up
+# both codegen and linking of the ~20 test binaries. Release profile is
+# untouched.
+[profile.dev]
+debug = "line-tables-only"

@@ -108,6 +108,12 @@ The current COW MVCC design clones the underlying store on the first mutation of
 
 ## Build
 
+Prerequisites: a Rust toolchain (see `rust-toolchain.toml`) and `protoc`
+(the protobuf compiler — needed by the `tonic-build` step that compiles
+`api/proto/homekv_service.proto`; install via `apt-get install
+protobuf-compiler` or from
+https://github.com/protocolbuffers/protobuf/releases).
+
 ```bash
 cargo build --release
 ```
