@@ -111,6 +111,50 @@ impl ThreeNodeBootstrap {
         self.nodes.keys().copied().collect()
     }
 
+    /// Extended bootstrap for M4 placement data groups with warm-standby
+    /// identities.
+    ///
+    /// Unlike [`ThreeNodeBootstrap::new`], this does NOT pin the peer set to
+    /// `M3_VOTER_IDS`: a placement data group hosts its voters plus warm
+    /// standbys (e.g. node 4) so a movement can admit a standby as a learner.
+    /// Endpoint hygiene (non-empty, unique endpoints) is still enforced.
+    /// M3's pinned construction path is unchanged.
+    pub fn new_extended(
+        cluster_id: impl Into<String>,
+        nodes: impl IntoIterator<Item = BootstrapNode>,
+    ) -> Result<Self, BootstrapError> {
+        let cluster_id: String = cluster_id.into();
+        if cluster_id.trim().is_empty() {
+            return Err(BootstrapError::EmptyClusterId);
+        }
+        let nodes = nodes
+            .into_iter()
+            .map(|node| (node.id, node))
+            .collect::<BTreeMap<_, _>>();
+        if nodes.is_empty() {
+            return Err(BootstrapError::WrongVoterCount { actual: 0 });
+        }
+        let bootstrap = Self { cluster_id, nodes };
+        bootstrap.validate_extended()?;
+        Ok(bootstrap)
+    }
+
+    /// Validate endpoint hygiene without the M3 voter-set pin.
+    pub fn validate_extended(&self) -> Result<(), BootstrapError> {
+        let mut endpoints = BTreeSet::new();
+        for node in self.nodes.values() {
+            if node.raft_endpoint.trim().is_empty() {
+                return Err(BootstrapError::EmptyEndpoint { node_id: node.id });
+            }
+            if !endpoints.insert(node.raft_endpoint.clone()) {
+                return Err(BootstrapError::DuplicateEndpoint {
+                    endpoint: node.raft_endpoint.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), BootstrapError> {
         if self.nodes.len() != M3_VOTER_IDS.len() {
             return Err(BootstrapError::WrongVoterCount {
