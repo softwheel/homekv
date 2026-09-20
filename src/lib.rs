@@ -18,5 +18,6 @@ pub mod raft_network;
 pub mod raft_observability;
 pub mod raft_storage;
 pub mod raft_transport;
+pub mod rebalance;
 pub mod routing;
 pub mod storage;

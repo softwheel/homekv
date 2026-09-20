@@ -694,6 +694,13 @@ where
         self.metrics.clone()
     }
 
+    /// Borrow the catalog port. The M4-T5 rebalancing scheduler commits
+    /// movement intents through the same port the driver reconciles, so a
+    /// single controller owns both sides of the intent lifecycle.
+    pub fn catalog(&self) -> &C {
+        &self.catalog
+    }
+
     pub async fn tombstone(
         &self,
         shard_id: u16,
