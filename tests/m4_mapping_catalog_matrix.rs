@@ -656,13 +656,17 @@ async fn corrupt_on_disk_catalog_state_fails_closed() {
         "a truncated on-disk snapshot must fail closed"
     );
 
-    // Truncated Raft log store: open fails cleanly, no panic.
+    // Truncated Raft log store metadata image: open fails cleanly, no panic.
+    // (M5 segmented WAL: the store path is a directory; `meta` is the small
+    // atomic image carrying the vote, committed position, and segment
+    // inventory.)
     let log_path = root.join("catalog-node-2.raft");
-    let log_bytes = fs::read(&log_path).unwrap();
+    let meta_path = log_path.join("meta");
+    let log_bytes = fs::read(&meta_path).unwrap();
     assert!(!log_bytes.is_empty());
     let mut truncated_log = log_bytes.clone();
     truncated_log.truncate(truncated_log.len() / 2);
-    fs::write(&log_path, &truncated_log).unwrap();
+    fs::write(&meta_path, &truncated_log).unwrap();
     assert!(
         HomeKvRaftLogStore::open(&log_path).is_err(),
         "a truncated on-disk Raft log must fail closed"
