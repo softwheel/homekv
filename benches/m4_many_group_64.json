@@ -1,0 +1,1 @@
+{"concurrencies":[1,8],"dataset_cardinality":64,"fault_cells":true,"idle_secs":5,"key_size":32,"mode":"engineering","operations_per_cell":2000,"schema_version":1,"seed":20260920,"selections":["uniform","skew"],"value_size":128,"warmup_operations":200,"workloads":["get","set","delete","read80_write20"]}
