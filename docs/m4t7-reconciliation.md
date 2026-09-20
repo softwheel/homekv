@@ -1,5 +1,10 @@
 # M4-T7 Final Verification Reconciliation
 
+> Follow-on evidence ledger: [`docs/m4t7-verification-evidence.md`](m4t7-verification-evidence.md)
+> (2026-09-20, identity `23d3d37`) records the post-blocker verification run.
+> It closes all four authorized blockers but leaves Spec 0006 at **Accepted**
+> with precise residual blockers (§4, §5, BAL-001, FAIL-004, §9).
+
 **Date:** 2026-09-20  
 **Spec:** 0006-multi-raft-placement  
 **Status:** **Accepted** (not Verified)  
