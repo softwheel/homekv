@@ -53,6 +53,7 @@ use crate::placement::{
 };
 use crate::placement_raft::CatalogGroupError;
 use crate::raft::RaftNodeId;
+use crate::raft_observability::{ReplicaHealth, ReplicaRole, ReplicaStatus};
 
 // ---------------------------------------------------------------------------
 // Planner
@@ -1278,17 +1279,85 @@ impl From<&SchedulerStatus> for PlanSummary {
     }
 }
 
+/// Per-group Raft state in the stable topology view (REQ-M4-OPS-001).
+///
+/// Every field is plain data: role, term, leader, committed membership
+/// config, commit/apply/log progress, apply lag and snapshot progress.
+/// No OpenRaft types cross this boundary; [`GroupRaftView::from_status`]
+/// is the single conversion point from [`ReplicaStatus`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GroupRaftView {
+    pub shard_id: u16,
+    pub role: ReplicaRole,
+    pub health: ReplicaHealth,
+    pub term: u64,
+    pub leader_id: Option<RaftNodeId>,
+    pub voters: Vec<RaftNodeId>,
+    pub learners: Vec<RaftNodeId>,
+    /// Last log index appended on this replica, if any.
+    pub log_index: Option<u64>,
+    /// Last committed log index known to this replica, if any.
+    pub commit_index: Option<u64>,
+    /// Last log index applied to this replica's state machine, if any.
+    pub apply_index: Option<u64>,
+    /// Committed-but-not-yet-applied entries (saturating subtraction).
+    pub apply_lag: u64,
+    /// Last log index included in a snapshot, if any.
+    pub snapshot_index: Option<u64>,
+}
+
+impl GroupRaftView {
+    /// Build the contract view from one replica's observed [`ReplicaStatus`].
+    ///
+    /// `shard_id` is the data-group shard this replica belongs to; the
+    /// status itself carries the Raft node identity. Learners are the
+    /// committed members that are not voters.
+    pub fn from_status(shard_id: u16, status: &ReplicaStatus) -> Self {
+        let mut voters = status.membership.voters.clone();
+        voters.sort_unstable();
+        let mut learners: Vec<RaftNodeId> = status
+            .membership
+            .members
+            .iter()
+            .filter(|member| !member.voter)
+            .map(|member| member.node_id)
+            .collect();
+        learners.sort_unstable();
+        let commit_index = status.committed.map(|position| position.index);
+        let apply_index = status.applied.map(|position| position.index);
+        let apply_lag = commit_index
+            .unwrap_or(0)
+            .saturating_sub(apply_index.unwrap_or(0));
+        Self {
+            shard_id,
+            role: status.role,
+            health: status.health,
+            term: status.current_term,
+            leader_id: status.leader_id,
+            voters,
+            learners,
+            log_index: status.last_log_index,
+            commit_index,
+            apply_index,
+            apply_lag,
+            snapshot_index: status.snapshot.map(|position| position.index),
+        }
+    }
+}
+
 /// Stable serializable topology view (REQ-M4-OPS-001).
 ///
-/// Cardinality is bounded: one entry per eligible node plus one per *active*
-/// movement. No per-shard metric labels are emitted; detailed per-shard
-/// inspection stays behind a paginated query path (REQ-M4-OPS-003).
+/// Cardinality is bounded: one entry per eligible node, one per *active*
+/// movement, and one per data group with observed Raft state. No per-shard
+/// metric labels are emitted; the per-group entries are the paginated
+/// per-shard inspection payload (REQ-M4-OPS-003).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TopologyView {
     pub cluster_id: ClusterId,
     pub placement_epoch: PlacementEpoch,
     pub catalog_health: CatalogHealth,
     pub nodes: Vec<NodeTopology>,
+    pub groups: Vec<GroupRaftView>,
     pub voter_skew: u64,
     pub leader_skew: u64,
     pub active_movements: Vec<MovementSummary>,
@@ -1299,6 +1368,7 @@ pub fn build_topology_view(
     catalog: &CatalogState,
     unavailable: &BTreeSet<RaftNodeId>,
     catalog_health: CatalogHealth,
+    groups: Vec<GroupRaftView>,
     plan: Option<PlanSummary>,
 ) -> TopologyView {
     let mut voter_counts: BTreeMap<RaftNodeId, u64> = BTreeMap::new();
@@ -1326,6 +1396,9 @@ pub fn build_topology_view(
     }
     active_movements.sort_by_key(|movement| movement.shard_id);
 
+    let mut groups = groups;
+    groups.sort_by_key(|group| group.shard_id);
+
     let nodes = catalog
         .eligible_nodes
         .values()
@@ -1344,6 +1417,7 @@ pub fn build_topology_view(
         placement_epoch: catalog.placement_epoch,
         catalog_health,
         nodes,
+        groups,
         voter_skew: skew(voter_counts.values().copied()),
         leader_skew: skew(leader_counts.values().copied()),
         active_movements,
@@ -2511,7 +2585,13 @@ mod tests {
         let catalog =
             bootstrap_catalog(vec![node(1, "a"), node(2, "b"), node(3, "c"), node(4, "d")]);
         let state = catalog.state().unwrap().clone();
-        let view = build_topology_view(&state, &empty_unavailable(), CatalogHealth::Healthy, None);
+        let view = build_topology_view(
+            &state,
+            &empty_unavailable(),
+            CatalogHealth::Healthy,
+            Vec::new(),
+            None,
+        );
         assert_eq!(view.nodes.len(), 4);
         assert!(view.voter_skew <= 1, "voter skew: {}", view.voter_skew);
         assert!(view.leader_skew <= 1, "leader skew: {}", view.leader_skew);
@@ -2552,6 +2632,7 @@ mod tests {
             CatalogHealth::Degraded {
                 unavailable_nodes: vec![4],
             },
+            Vec::new(),
             Some(PlanSummary {
                 source_epoch: 1,
                 queued: 3,
@@ -2710,5 +2791,201 @@ mod tests {
             response,
             CatalogResponse::DesiredLeaderUpdated { .. } | CatalogResponse::DesiredLeaderAlreadySet
         ));
+    }
+
+    // -- per-group Raft fields (REQ-M4-OPS-001) --------------------------------
+
+    use crate::raft_observability::{
+        ElectionIdentity, LeadershipMetricsSnapshot, LogPosition, MembershipStatus, ReplicaMember,
+    };
+
+    fn log_position(term: u64, index: u64) -> LogPosition {
+        LogPosition {
+            term,
+            leader_id: 1,
+            index,
+        }
+    }
+
+    fn replica_status(
+        role: ReplicaRole,
+        term: u64,
+        voters: Vec<u64>,
+        learners: Vec<u64>,
+        commit_index: Option<u64>,
+        apply_index: Option<u64>,
+    ) -> ReplicaStatus {
+        let members = voters
+            .iter()
+            .map(|node_id| ReplicaMember {
+                node_id: *node_id,
+                endpoint: format!("127.0.0.1:{node_id}"),
+                voter: true,
+            })
+            .chain(learners.iter().map(|node_id| ReplicaMember {
+                node_id: *node_id,
+                endpoint: format!("127.0.0.1:{node_id}"),
+                voter: false,
+            }))
+            .collect();
+        ReplicaStatus {
+            node_id: 1,
+            role,
+            health: ReplicaHealth::Running,
+            leader_id: Some(1),
+            current_term: term,
+            vote: ElectionIdentity {
+                term,
+                candidate_id: 1,
+                committed: true,
+            },
+            last_log_index: commit_index,
+            committed: commit_index.map(|index| log_position(term, index)),
+            applied: apply_index.map(|index| log_position(term, index)),
+            membership: MembershipStatus {
+                log: None,
+                voters,
+                members,
+            },
+            snapshot: Some(log_position(term.saturating_sub(1), 40)),
+            purged: None,
+            leadership: LeadershipMetricsSnapshot::default(),
+        }
+    }
+
+    #[test]
+    fn group_raft_view_maps_role_term_config_and_progress() {
+        let status = replica_status(
+            ReplicaRole::Leader,
+            7,
+            vec![3, 1, 2],
+            vec![9],
+            Some(100),
+            Some(96),
+        );
+        let view = GroupRaftView::from_status(42, &status);
+        assert_eq!(view.shard_id, 42);
+        assert_eq!(view.role, ReplicaRole::Leader);
+        assert_eq!(view.health, ReplicaHealth::Running);
+        assert_eq!(view.term, 7);
+        assert_eq!(view.leader_id, Some(1));
+        assert_eq!(view.voters, vec![1, 2, 3]);
+        assert_eq!(view.learners, vec![9]);
+        assert_eq!(view.log_index, Some(100));
+        assert_eq!(view.commit_index, Some(100));
+        assert_eq!(view.apply_index, Some(96));
+        assert_eq!(view.apply_lag, 4);
+        assert_eq!(view.snapshot_index, Some(40));
+    }
+
+    #[test]
+    fn group_raft_view_lag_saturates_without_progress() {
+        let status = replica_status(ReplicaRole::Follower, 3, vec![1, 2, 3], vec![], None, None);
+        let view = GroupRaftView::from_status(7, &status);
+        assert_eq!(view.commit_index, None);
+        assert_eq!(view.apply_index, None);
+        assert_eq!(view.apply_lag, 0);
+        assert_eq!(view.snapshot_index, Some(40));
+    }
+
+    #[test]
+    fn topology_view_carries_per_group_entries_sorted_by_shard() {
+        let catalog =
+            bootstrap_catalog(vec![node(1, "a"), node(2, "b"), node(3, "c"), node(4, "d")]);
+        let state = catalog.state().unwrap().clone();
+        let groups = vec![
+            GroupRaftView::from_status(
+                9,
+                &replica_status(
+                    ReplicaRole::Follower,
+                    2,
+                    vec![1, 2, 3],
+                    vec![],
+                    Some(10),
+                    Some(10),
+                ),
+            ),
+            GroupRaftView::from_status(
+                3,
+                &replica_status(
+                    ReplicaRole::Leader,
+                    2,
+                    vec![1, 2, 3],
+                    vec![],
+                    Some(12),
+                    Some(11),
+                ),
+            ),
+        ];
+        let view = build_topology_view(
+            &state,
+            &empty_unavailable(),
+            CatalogHealth::Healthy,
+            groups,
+            None,
+        );
+        assert_eq!(view.groups.len(), 2);
+        assert_eq!(view.groups[0].shard_id, 3);
+        assert_eq!(view.groups[1].shard_id, 9);
+        assert_eq!(view.groups[0].role, ReplicaRole::Leader);
+        assert_eq!(view.groups[0].apply_lag, 1);
+        assert_eq!(view.groups[1].apply_lag, 0);
+    }
+
+    #[test]
+    fn topology_view_without_groups_stays_backward_compatible() {
+        let catalog = bootstrap_catalog(vec![node(1, "a"), node(2, "b"), node(3, "c")]);
+        let state = catalog.state().unwrap().clone();
+        let view = build_topology_view(
+            &state,
+            &empty_unavailable(),
+            CatalogHealth::Healthy,
+            Vec::new(),
+            None,
+        );
+        assert!(view.groups.is_empty());
+        assert!(!view.nodes.is_empty());
+    }
+
+    #[test]
+    fn topology_view_serialization_exposes_no_openraft_types() {
+        let catalog = bootstrap_catalog(vec![node(1, "a"), node(2, "b"), node(3, "c")]);
+        let state = catalog.state().unwrap().clone();
+        let groups = vec![GroupRaftView::from_status(
+            5,
+            &replica_status(
+                ReplicaRole::Candidate,
+                4,
+                vec![1, 2, 3],
+                vec![7],
+                Some(20),
+                Some(18),
+            ),
+        )];
+        let view = build_topology_view(
+            &state,
+            &empty_unavailable(),
+            CatalogHealth::Healthy,
+            groups,
+            None,
+        );
+        let json = serde_json::to_string(&view).unwrap();
+        // The contract must not leak OpenRaft Rust type names.
+        for leaked in [
+            "openraft",
+            "ServerState",
+            "RaftMetrics",
+            "StoredMembership",
+            "MembershipConfig",
+        ] {
+            assert!(
+                !json.contains(leaked),
+                "topology JSON leaks OpenRaft type name: {leaked}"
+            );
+        }
+        let round_tripped: TopologyView = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped, view);
+        assert_eq!(round_tripped.groups[0].learners, vec![7]);
+        assert_eq!(round_tripped.groups[0].apply_lag, 2);
     }
 }
