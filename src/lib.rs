@@ -11,6 +11,7 @@ pub mod honey_bees;
 pub mod movement;
 pub mod movement_admission;
 pub mod placement;
+pub mod placement_metrics;
 pub mod placement_node;
 pub mod placement_raft;
 pub mod raft;

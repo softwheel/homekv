@@ -39,14 +39,17 @@ use tokio::time::interval;
 
 use crate::movement::{
     LiveMembershipOperator, LocalReplicaJanitor, MovementDriver, MovementDriverConfig,
+    MovementMetrics,
 };
 use crate::movement_admission::{MovementWorkAdmission, MovementWorkConfig};
 use crate::placement::{CatalogState, EligibleNode};
 use crate::placement_raft::PlacementCatalogGroup;
 use crate::raft::{HomeKvRaftConfig, HomeKvStateMachine, RaftNode, RaftNodeId};
 use crate::raft_network::HomeKvRaftNetworkFactory;
+use crate::raft_observability::HomeKvReplicaObserver;
 use crate::raft_storage::HomeKvRaftLogStore;
 use crate::raft_transport::{BootstrapNode, TestLinkController, ThreeNodeBootstrap};
+use crate::routing::RouteRedirectMetrics;
 use openraft::Raft;
 
 /// Configuration for [`PlacementNode`].
@@ -199,10 +202,10 @@ impl PlacementNodeConfig {
 /// can observe live durable replica state; it shares the same underlying
 /// store as the Raft instance.
 #[derive(Clone)]
-struct Replica {
-    raft: Raft<HomeKvRaftConfig>,
-    state_machine: Arc<HomeKvStateMachine>,
-    log_store: HomeKvRaftLogStore,
+pub(crate) struct Replica {
+    pub(crate) raft: Raft<HomeKvRaftConfig>,
+    pub(crate) state_machine: Arc<HomeKvStateMachine>,
+    pub(crate) log_store: HomeKvRaftLogStore,
 }
 
 /// Start all replicas for one Raft group (catalog or data group).
@@ -214,6 +217,16 @@ struct Replica {
 ///
 /// `extended` selects the warm-standby factory path (data groups); the
 /// catalog uses the pinned M3 path.
+///
+/// The network factories are returned (not dropped) so the production
+/// metrics surface can observe per-peer RPC attempts, failures,
+/// backpressure rejections and payload bytes for the node's whole
+/// lifetime (spec 0006 §9).
+struct StartedReplicas {
+    replicas: BTreeMap<RaftNodeId, Replica>,
+    factories: BTreeMap<RaftNodeId, HomeKvRaftNetworkFactory>,
+}
+
 async fn start_replicas(
     raft_config: &Arc<Config>,
     links: &TestLinkController,
@@ -222,7 +235,7 @@ async fn start_replicas(
     dir: &Path,
     node_ids: &[RaftNodeId],
     extended: bool,
-) -> Result<BTreeMap<RaftNodeId, Replica>, PlacementNodeError> {
+) -> Result<StartedReplicas, PlacementNodeError> {
     std::fs::create_dir_all(dir).map_err(|e| PlacementNodeError::Io(e.to_string()))?;
     let mut factories = BTreeMap::new();
     for id in node_ids {
@@ -265,7 +278,10 @@ async fn start_replicas(
                 .map_err(|e| PlacementNodeError::Raft(format!("{cluster_name} handler: {e:?}")))?;
         }
     }
-    Ok(replicas)
+    Ok(StartedReplicas {
+        replicas,
+        factories,
+    })
 }
 
 /// Wait, bounded by `timeout`, for the freshly initialized catalog primary
@@ -382,9 +398,22 @@ impl LocalReplicaJanitor for FsReplicaJanitor {
 type DriverKey = (u16, RaftNodeId);
 
 /// The production placement-node composition root.
+///
+/// Besides the Raft groups and movement drivers, the node retains the
+/// network factories, movement metric handles, replica observers and the
+/// redirect metric handle for its whole lifetime so the §9 production
+/// metrics surface ([`PlacementNode::metrics_snapshot`]) can observe them.
+/// Nothing here is per-key or per-operation: every retained handle is
+/// bounded by (shards × identities) plus the catalog.
 pub struct PlacementNode {
-    catalog: PlacementCatalogGroup,
-    groups: BTreeMap<u16, BTreeMap<RaftNodeId, Replica>>,
+    pub(crate) catalog: PlacementCatalogGroup,
+    pub(crate) catalog_factories: BTreeMap<RaftNodeId, HomeKvRaftNetworkFactory>,
+    pub(crate) groups: BTreeMap<u16, BTreeMap<RaftNodeId, Replica>>,
+    pub(crate) group_factories: BTreeMap<u16, BTreeMap<RaftNodeId, HomeKvRaftNetworkFactory>>,
+    pub(crate) movement_metrics: BTreeMap<DriverKey, MovementMetrics>,
+    pub(crate) observers: BTreeMap<DriverKey, HomeKvReplicaObserver>,
+    pub(crate) redirect_metrics: RouteRedirectMetrics,
+    pub(crate) shards: Vec<u16>,
     drive_task: JoinHandle<()>,
 }
 
@@ -419,7 +448,7 @@ impl PlacementNode {
         )
         .map_err(|e| PlacementNodeError::Raft(format!("catalog bootstrap: {e:?}")))?;
 
-        let catalog_replicas = start_replicas(
+        let catalog_started = start_replicas(
             &raft_config,
             &links,
             &catalog_bootstrap,
@@ -429,6 +458,8 @@ impl PlacementNode {
             false,
         )
         .await?;
+        let catalog_replicas = catalog_started.replicas;
+        let catalog_factories = catalog_started.factories;
         let catalog_membership: BTreeMap<RaftNodeId, RaftNode> = config
             .catalog_voters
             .iter()
@@ -499,6 +530,8 @@ impl PlacementNode {
         .map_err(|e| PlacementNodeError::Admission(e.to_string()))?;
 
         let mut groups = BTreeMap::new();
+        let mut group_factories: BTreeMap<u16, BTreeMap<RaftNodeId, HomeKvRaftNetworkFactory>> =
+            BTreeMap::new();
         let mut drivers = BTreeMap::new();
         for shard_id in &config.shards {
             let placement = committed.placements.get(shard_id).ok_or_else(|| {
@@ -517,7 +550,7 @@ impl PlacementNode {
             )
             .map_err(|e| PlacementNodeError::Raft(format!("group bootstrap: {e:?}")))?;
 
-            let replicas = start_replicas(
+            let group_started = start_replicas(
                 &raft_config,
                 &links,
                 &group_bootstrap,
@@ -527,6 +560,8 @@ impl PlacementNode {
                 true,
             )
             .await?;
+            let replicas = group_started.replicas;
+            group_factories.insert(*shard_id, group_started.factories);
             // Only the committed voters form the initial membership; warm
             // standbys hold idle replicas until a movement adds them.
             let initial: BTreeMap<RaftNodeId, RaftNode> = placement
@@ -576,9 +611,33 @@ impl PlacementNode {
             groups.insert(*shard_id, replicas);
         }
 
+        // --- observability handles -----------------------------------------
+        // One long-lived replica observer per hosted replica: the observer
+        // tracks leadership transitions in the background, and its snapshot
+        // is the §9 per-group Raft field source. Observers are created once
+        // (not per scrape) so metrics collection spawns no per-call tasks.
+        let mut observers = BTreeMap::new();
+        for (shard_id, replicas) in &groups {
+            for (id, replica) in replicas {
+                observers.insert(
+                    (*shard_id, *id),
+                    HomeKvReplicaObserver::new(
+                        replica.raft.clone(),
+                        replica.log_store.clone(),
+                        (*replica.state_machine).clone(),
+                    ),
+                );
+            }
+        }
+        // Movement metric handles are cloned out of the drivers before the
+        // drivers move into the drive loop.
+        let movement_metrics: BTreeMap<DriverKey, MovementMetrics> = drivers
+            .iter()
+            .map(|(key, driver)| (*key, driver.metrics()))
+            .collect();
+
         // --- drive loop ----------------------------------------------------
         let drivers = Arc::new(drivers);
-        // --- drive loop ----------------------------------------------------
         let drive_task = {
             let catalog = catalog.clone();
             let drivers = Arc::clone(&drivers);
@@ -649,9 +708,26 @@ impl PlacementNode {
 
         Ok(Self {
             catalog,
+            catalog_factories,
             groups,
+            group_factories,
+            movement_metrics,
+            observers,
+            redirect_metrics: RouteRedirectMetrics::default(),
+            shards: config.shards.clone(),
             drive_task,
         })
+    }
+
+    /// Shared redirect counters for this node's serving layer.
+    ///
+    /// The placement composition does not serve data-plane requests itself;
+    /// a deployment wires its [`CommittedRouteResolver`](crate::routing::CommittedRouteResolver)s
+    /// to this handle (via
+    /// [`with_metrics`](crate::routing::CommittedRouteResolver::with_metrics))
+    /// so redirects by cause are observable on the node.
+    pub fn route_redirect_metrics(&self) -> RouteRedirectMetrics {
+        self.redirect_metrics.clone()
     }
 
     /// The catalog group handle (for operators/tests).

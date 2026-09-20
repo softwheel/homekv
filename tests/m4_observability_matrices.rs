@@ -19,11 +19,14 @@
 //! - movement surfaces phase transitions in the topology view and clears
 //!   them after convergence.
 //!
-//! What this file deliberately does not cover: OS-level counters (runtime
-//! workers, connection counts, per-group memory). Those live outside the
-//! library's public observation surface; the assertions here cover every
-//! HomeKV-owned representation the spec's §9 list names through the public
-//! API.
+//! What this file deliberately does not cover: timer counts (no stable Tokio
+//! API without `tokio_unstable`), socket-level connection bytes (the
+//! in-process transport has no sockets), catalog *health* (operator-computed
+//! from probes, covered by the topology-view tests above), and
+//! movement-attributed byte transfer (replication does not tag bytes as
+//! movement vs. ordinary traffic; per-replica snapshot transfer bytes are
+//! reported instead). Those gaps are documented, not invented, in
+//! [`homekv::placement_metrics`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -34,6 +37,7 @@ use homekv::movement::CatalogPort;
 use homekv::placement::{
     CatalogCommand, CatalogResponse, CatalogState, EligibleNode, PlacementCatalog,
 };
+use homekv::placement_metrics::PlacementMetrics;
 use homekv::placement_node::{PlacementNode, PlacementNodeConfig};
 use homekv::placement_raft::CatalogGroupError;
 use homekv::raft::{RaftCommand, RaftNodeId};
@@ -41,7 +45,7 @@ use homekv::raft_observability::{HomeKvReplicaObserver, ReplicaRole};
 use homekv::rebalance::{
     build_topology_view, CatalogHealth, CatalogHealthGate, FnProbe, GroupRaftView, TopologyView,
 };
-use homekv::routing::{CommittedRouteResolver, RouteDecision};
+use homekv::routing::{CommittedRouteResolver, RedirectCause, RouteDecision};
 use tokio::sync::RwLock;
 
 const SHARDS: [u16; 4] = [3, 11, 29, 44];
@@ -631,6 +635,449 @@ async fn movement_surfaces_phases_and_clears_on_convergence() {
         voters.sort_unstable();
         assert_eq!(voters, target_voters);
     }
+
+    node.shutdown();
+}
+
+// ---- Slice C: §9 production metrics surface -------------------------------
+// The tests below cover the [`PlacementNode::metrics_snapshot`] surface:
+// runtime workers, per-group Raft fields, RPC counts/bytes/rejections,
+// memory by group and aggregate, redirects by cause, movement
+// phase/duration/result, voter/leader skew, and bounded cardinality.
+
+/// §9: the production snapshot covers every §9 field through one
+/// HomeKV-owned, serializable representation after real bootstrap,
+/// elections and writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_snapshot_covers_section_9_fields() {
+    let node = PlacementNode::start(node_config(
+        "obs-prod-snap",
+        *b"homekv-m4-obs10X",
+        SHARDS.to_vec(),
+    ))
+    .await
+    .expect("node starts");
+
+    // Elect a leader per group and commit one write per shard so the
+    // snapshot observes real replication traffic (attempts + payload
+    // bytes), not idle heartbeats.
+    for shard in SHARDS {
+        let leader = wait_for(
+            || async { node.group_leader(shard) },
+            Duration::from_secs(15),
+            "data-group leader",
+        )
+        .await;
+        node.group_raft(shard, leader)
+            .expect("leader raft")
+            .client_write(RaftCommand::Set {
+                key: format!("obs-snap-key-{shard}").into_bytes(),
+                value: b"obs-snap-value".to_vec(),
+            })
+            .await
+            .expect("write commits");
+    }
+    wait_for(
+        || async { node.catalog().raft().metrics().borrow().current_leader },
+        Duration::from_secs(15),
+        "catalog leader",
+    )
+    .await;
+
+    let snap = node.metrics_snapshot().await.expect("snapshot works");
+
+    // Runtime: the shared worker pool is fixed and sampled from the live
+    // runtime.
+    assert!(snap.runtime.sampled);
+    assert_eq!(snap.runtime.num_workers, 4);
+
+    // Catalog identity matches the committed view.
+    let state = node.committed_state().await.expect("catalog readable");
+    assert_eq!(snap.catalog.placement_epoch, state.placement_epoch);
+    assert!(snap.catalog.leader_id.is_some(), "catalog elected a leader");
+
+    // Group counts: exclusive states covering every loaded shard.
+    assert_eq!(snap.group_counts.loaded, SHARDS.len());
+    assert_eq!(
+        snap.group_counts.active + snap.group_counts.idle + snap.group_counts.error,
+        snap.group_counts.loaded,
+        "active/idle/error partition the loaded shards"
+    );
+    assert_eq!(
+        snap.group_counts.active,
+        SHARDS.len(),
+        "every group has an observed leader"
+    );
+
+    // Skew matches the deterministic bootstrap bound.
+    assert!(
+        snap.skew.voter_skew <= 1 && snap.skew.leader_skew <= 1,
+        "skew: {:?}",
+        snap.skew
+    );
+
+    // RPC: catalog factories (one per catalog voter) plus one factory set
+    // per shard (one per hosted identity); every factory carries a fixed
+    // peer set (3 catalog voters / 4 group nodes); real traffic moved real
+    // bytes.
+    assert_eq!(snap.rpc.factories.len(), 3 + SHARDS.len() * 4);
+    for factory in &snap.rpc.factories {
+        match factory.shard_id {
+            None => assert_eq!(factory.peers.len(), 3, "catalog peer set is the 3 voters"),
+            Some(_) => assert_eq!(factory.peers.len(), 4, "group peer set is all 4 nodes"),
+        }
+    }
+    assert!(snap.rpc.totals.attempts > 0);
+    assert!(
+        snap.rpc.totals.bytes > 0,
+        "writes replicate application payload bytes"
+    );
+
+    // Memory: RSS parsed on Linux, one entry per hosted replica,
+    // aggregate equals the sum of the parts.
+    assert!(
+        snap.memory.process_rss_bytes.is_some(),
+        "RSS readable on Linux"
+    );
+    assert_eq!(snap.memory.per_replica.len(), SHARDS.len() * 4);
+    let sum: u64 = snap
+        .memory
+        .per_replica
+        .iter()
+        .map(|entry| entry.state_machine_data_bytes)
+        .sum();
+    assert_eq!(snap.memory.aggregate_state_machine_data_bytes, sum);
+
+    // Redirects: bounded cause set, quiet when nothing redirects.
+    assert_eq!(snap.redirects.total, 0);
+    assert_eq!(snap.redirects.by_cause.len(), 2);
+
+    // Movement: one driver view per (shard, identity); bounded history.
+    assert_eq!(snap.movement.len(), SHARDS.len() * 4);
+    for driver in &snap.movement {
+        assert!(
+            driver.metrics.recent.len() <= 64,
+            "recent-operation ring stays bounded"
+        );
+    }
+
+    // Per-shard detail: shape, sort order, cross-links.
+    assert_eq!(snap.shards.len(), SHARDS.len());
+    let shard_ids: Vec<u16> = snap.shards.iter().map(|s| s.shard_id).collect();
+    let mut sorted = shard_ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(shard_ids, sorted, "shard entries sorted");
+    for shard in &snap.shards {
+        assert_eq!(shard.replicas.len(), 4);
+        assert_eq!(shard.movement.len(), 4);
+        assert_eq!(shard.rpc.len(), 4);
+        assert!(shard.active, "shard {} has a leader", shard.shard_id);
+        assert!(!shard.error);
+        for replica in &shard.replicas {
+            assert_eq!(replica.memory.shard_id, shard.shard_id);
+            // Role/term/config/commit/apply/snapshot/lag are the PR #89
+            // per-group Raft fields for the same replica.
+            assert_eq!(replica.raft.shard_id, shard.shard_id);
+        }
+    }
+
+    // The whole snapshot is a serializable HomeKV-owned representation:
+    // JSON round-trips with no openraft leakage.
+    let json = serde_json::to_string(&snap).expect("snapshot serializes");
+    assert!(!json.contains("openraft"), "no openraft types leak");
+    let back: PlacementMetrics = serde_json::from_str(&json).expect("snapshot deserializes");
+    assert_eq!(back, snap);
+
+    node.shutdown();
+}
+
+/// §9 / REQ-M4-GROUP-002 + GROUP-003: the shared runtime worker pool and
+/// the per-factory peer sets stay fixed while the group count grows; only
+/// per-replica series (shards x hosted identities) and factory handles
+/// scale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtime_workers_and_peer_sets_fixed_as_groups_grow() {
+    let small = PlacementNode::start(node_config(
+        "obs-scale-small",
+        *b"homekv-m4-obs11X",
+        vec![7],
+    ))
+    .await
+    .expect("small node starts");
+    let big = PlacementNode::start(node_config(
+        "obs-scale-big",
+        *b"homekv-m4-obs12X",
+        (0..8).collect(),
+    ))
+    .await
+    .expect("big node starts");
+
+    let small_snap = small.metrics_snapshot().await.expect("small snapshot");
+    let big_snap = big.metrics_snapshot().await.expect("big snapshot");
+
+    // The shared worker pool does not grow with the group count.
+    assert_eq!(small_snap.runtime.num_workers, 4);
+    assert_eq!(big_snap.runtime.num_workers, 4);
+
+    // Per-replica series grow exactly with shards x hosted identities.
+    assert_eq!(small_snap.memory.per_replica.len(), 4); // 1 shard x 4 identities
+    assert_eq!(big_snap.memory.per_replica.len(), 32); // 8 shards x 4 identities
+    assert_eq!(big_snap.movement.len(), 8 * small_snap.movement.len());
+
+    // The per-factory peer set is fixed (3 catalog voters / 4 group nodes)
+    // on both nodes: the connection-like unit is the peer slot, not a
+    // socket, and it does not multiply with shards. Factory *handles* are
+    // per (group, identity).
+    for factory in small_snap
+        .rpc
+        .factories
+        .iter()
+        .chain(&big_snap.rpc.factories)
+    {
+        let expected = if factory.shard_id.is_none() { 3 } else { 4 };
+        assert_eq!(factory.peers.len(), expected, "fixed peer set per factory");
+    }
+    assert_eq!(small_snap.rpc.factories.len(), 7); // 3 catalog voters + 1 shard x 4
+    assert_eq!(big_snap.rpc.factories.len(), 35); // 3 catalog voters + 8 shards x 4
+
+    small.shutdown();
+    big.shutdown();
+}
+
+/// §9 / REQ-M4-OPS-003: per-shard inspection is paginated and the
+/// per-replica series count is independent of the key count.
+#[tokio::test]
+async fn shard_metrics_pagination_bounds_cardinality() {
+    let node = PlacementNode::start(node_config(
+        "obs-pages",
+        *b"homekv-m4-obs13X",
+        (0..8).collect(),
+    ))
+    .await
+    .expect("node starts");
+
+    // Commit many keys: per-replica series must not grow with the key
+    // count (no per-key labels anywhere).
+    let leader = wait_for(
+        || async { node.group_leader(0) },
+        Duration::from_secs(15),
+        "data-group leader",
+    )
+    .await;
+    for i in 0..50u32 {
+        node.group_raft(0, leader)
+            .expect("leader raft")
+            .client_write(RaftCommand::Set {
+                key: format!("page-key-{i}").into_bytes(),
+                value: vec![0u8; 16],
+            })
+            .await
+            .expect("write commits");
+    }
+
+    let snap = node.metrics_snapshot().await.expect("snapshot");
+    assert_eq!(
+        snap.memory.per_replica.len(),
+        8 * 4,
+        "no key-derived series after 50 writes"
+    );
+
+    let page0 = node.metrics_for_shards(0, 3).await;
+    assert_eq!(page0.len(), 3);
+    let page1 = node.metrics_for_shards(3, 3).await;
+    assert_eq!(page1.len(), 3);
+    let page2 = node.metrics_for_shards(6, 3).await;
+    assert_eq!(page2.len(), 2);
+    assert!(node.metrics_for_shards(8, 3).await.is_empty());
+    assert!(node.metrics_for_shards(0, 0).await.is_empty());
+
+    let ids: Vec<u16> = page0
+        .iter()
+        .chain(&page1)
+        .chain(&page2)
+        .map(|entry| entry.shard_id)
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(ids, sorted, "pages arrive in shard-id order");
+    assert_eq!(ids.len(), 8, "pages cover every shard exactly once");
+
+    node.shutdown();
+}
+
+/// §9: route redirects are counted by cause through the node's shared
+/// metrics handle; local routes are not counted.
+#[tokio::test]
+async fn route_redirects_counted_by_cause() {
+    let node = PlacementNode::start(node_config(
+        "obs-redirect-cause",
+        *b"homekv-m4-obs14X",
+        SHARDS.to_vec(),
+    ))
+    .await
+    .expect("node starts");
+    let committed = node.committed_state().await.expect("catalog readable");
+
+    let metrics = node.route_redirect_metrics();
+    let catalog = Arc::new(RwLock::new({
+        let mut catalog = PlacementCatalog::default();
+        catalog
+            .apply(CatalogCommand::Bootstrap {
+                cluster_id: *b"homekv-m4-obs14X",
+                eligible_nodes: committed.eligible_nodes.values().cloned().collect(),
+            })
+            .unwrap();
+        catalog
+    }));
+
+    let shard = SHARDS[0];
+    let voters = committed.placements[&shard].voters;
+    let outsider = [1u64, 2, 3, 4]
+        .into_iter()
+        .find(|id| !voters.contains(id))
+        .expect("an eligible non-voter exists");
+    let voter = voters[0];
+    let outsider_resolver =
+        CommittedRouteResolver::with_metrics(outsider, Arc::clone(&catalog), metrics.clone());
+    let voter_resolver =
+        CommittedRouteResolver::with_metrics(voter, Arc::clone(&catalog), metrics.clone());
+
+    assert!(matches!(
+        outsider_resolver.resolve(shard).await,
+        RouteDecision::Redirect(_)
+    ));
+    assert!(matches!(
+        outsider_resolver.resolve(9999).await,
+        RouteDecision::Unavailable
+    ));
+    assert!(matches!(
+        voter_resolver.resolve(shard).await,
+        RouteDecision::Local { .. }
+    ));
+    assert!(matches!(
+        outsider_resolver.resolve(shard).await,
+        RouteDecision::Redirect(_)
+    ));
+
+    // The resolver handle shares the node's counters.
+    assert_eq!(metrics.total(), 3);
+
+    let snap = node.metrics_snapshot().await.expect("snapshot");
+    let by_cause: BTreeMap<_, _> = snap.redirects.by_cause.into_iter().collect();
+    assert_eq!(by_cause.len(), 2, "closed cause set");
+    assert_eq!(by_cause[&RedirectCause::NotCommittedVoter], 2);
+    assert_eq!(by_cause[&RedirectCause::NoCommittedPlacement], 1);
+    assert_eq!(snap.redirects.total, 3);
+
+    node.shutdown();
+}
+
+/// §9: every movement driver surfaces phase attempts/successes/failures,
+/// operation outcomes and bounded per-operation durations after a real
+/// movement converges.
+#[tokio::test]
+async fn movement_driver_metrics_surfaced_per_driver() {
+    const MOVING: u16 = 11;
+    let node = PlacementNode::start(node_config(
+        "obs-movement-metrics",
+        *b"homekv-m4-obs15X",
+        vec![MOVING],
+    ))
+    .await
+    .expect("node starts");
+    let state = node.committed_state().await.expect("catalog readable");
+    let source_voters = state.placements[&MOVING].voters;
+    let epoch = state.placement_epoch;
+    let incoming = [1u64, 2, 3, 4]
+        .into_iter()
+        .find(|id| !source_voters.contains(id))
+        .expect("an eligible standby exists");
+    let mut target_voters = source_voters;
+    target_voters[2] = incoming;
+    target_voters.sort_unstable();
+
+    let leader = wait_for(
+        || async { node.group_leader(MOVING) },
+        Duration::from_secs(15),
+        "data-group leader",
+    )
+    .await;
+    node.group_raft(MOVING, leader)
+        .expect("leader raft")
+        .client_write(RaftCommand::Set {
+            key: b"obs-mvmetrics-key".to_vec(),
+            value: b"obs-mvmetrics-value".to_vec(),
+        })
+        .await
+        .expect("write commits");
+
+    let op_id = *b"homekv-m4-obs-02";
+    let response = node
+        .catalog()
+        .submit(CatalogCommand::BeginMovement {
+            expected_epoch: epoch,
+            operation_id: op_id,
+            shard_id: MOVING,
+            target_voters,
+        })
+        .await
+        .expect("begin movement commits");
+    assert!(
+        matches!(response, CatalogResponse::MovementAccepted { .. }),
+        "unexpected catalog response: {response:?}"
+    );
+
+    wait_for(
+        || async {
+            let state = node.committed_state().await.ok()?;
+            let placement = state.placements.get(&MOVING)?;
+            (placement.voters == target_voters && placement.pending_movement.is_none())
+                .then_some(())
+        },
+        Duration::from_secs(60),
+        "movement convergence",
+    )
+    .await;
+
+    let snap = node.metrics_snapshot().await.expect("snapshot");
+    assert_eq!(snap.movement.len(), 4, "one view per hosted driver");
+    let mut saw_phase_activity = false;
+    let mut saw_completed_operation = false;
+    for driver in &snap.movement {
+        assert_eq!(driver.shard_id, MOVING);
+        let metrics = &driver.metrics;
+        assert!(
+            metrics.recent.len() <= 64,
+            "recent-operation ring stays bounded"
+        );
+        let phase_attempts: u64 = metrics.phase_attempts.values().sum();
+        if phase_attempts > 0 {
+            saw_phase_activity = true;
+        }
+        if metrics.operations_completed > 0 {
+            saw_completed_operation = true;
+            assert!(
+                metrics.recent.iter().any(|op| op.duration_millis > 0),
+                "completed operations record durations"
+            );
+        }
+    }
+    assert!(
+        saw_phase_activity,
+        "drivers recorded movement phase attempts"
+    );
+    assert!(
+        saw_completed_operation,
+        "at least one driver completed the movement"
+    );
+
+    // The shard entry carries the same driver views.
+    let entry = snap
+        .shards
+        .iter()
+        .find(|s| s.shard_id == MOVING)
+        .expect("shard entry");
+    assert_eq!(entry.movement.len(), 4);
 
     node.shutdown();
 }

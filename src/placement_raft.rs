@@ -54,6 +54,12 @@ impl PlacementCatalogGroup {
         }
     }
 
+    /// The underlying Raft handle (observability: catalog leader/term for
+    /// the §9 metrics surface).
+    pub fn raft(&self) -> &Raft<HomeKvRaftConfig> {
+        &self.raft
+    }
+
     pub async fn bootstrap(
         &self,
         cluster_id: [u8; 16],
