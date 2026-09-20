@@ -25,7 +25,8 @@
 //!   library's on-disk snapshot format (fail-closed decode, already
 //!   unit-tested in `raft.rs`) at group level, using a configured snapshot
 //!   path. The production on-disk fault surface for data groups is exactly
-//!   the single `.raft` store file per replica.
+//!   the M5 segmented-WAL store directory per replica (`meta` atomic image +
+//!   `wal/` segments).
 //! - `PlacementNode::start` fails the whole node (clean
 //!   [`PlacementNodeError::Io`]) when any replica's store is corrupt, rather
 //!   than isolating the bad group. That is honest fail-closed — the corrupt
@@ -109,7 +110,7 @@ struct DataGroupNode {
 /// group spread across three processes.
 ///
 /// Replica `id`'s store lives at `<root>/node-<id>/groups/<shard:04>/`
-/// `node-<id>.raft`: the same single-file layout the production
+/// `node-<id>.raft`: the same store directory layout the production
 /// [`PlacementNode`] composition root uses, so [`FsReplicaJanitor`] (the
 /// production janitor) operates on it directly.
 struct DataGroupCluster {
@@ -321,9 +322,13 @@ impl DataGroupCluster {
     /// Corrupt one replica's on-disk log store the way a torn write, bit
     /// rot, or format-version skew would. Returns the message fragment the
     /// fail-closed error must contain.
+    ///
+    /// M5 segmented WAL: the corruption targets the atomic `meta` image
+    /// (vote, committed position, segment inventory) inside the store
+    /// directory.
     fn corrupt_store(&self, id: RaftNodeId, mode: CorruptMode) -> &'static str {
-        let path = self.store_path(id);
-        let mut bytes = std::fs::read(&path).expect("store file exists");
+        let path = self.store_path(id).join("meta");
+        let mut bytes = std::fs::read(&path).expect("store meta image exists");
         let expect = match mode {
             CorruptMode::Checksum => {
                 let mid = bytes.len() / 2;
@@ -626,10 +631,14 @@ async fn placement_node_start_fails_closed_on_corrupt_data_replica_store() {
         .join("groups")
         .join(format!("{SHARD:04}"))
         .join(format!("node-{victim}.raft"));
-    let mut bytes = std::fs::read(&store_path).expect("replica store exists");
-    let mid = bytes.len() / 2;
-    bytes[mid] ^= 0x5a;
-    std::fs::write(&store_path, bytes).expect("corrupt store written");
+    // M5 segmented WAL: corrupt the atomic metadata image (the last byte is
+    // inside the checksummed payload, so this deterministically trips the
+    // checksum gate and fails closed on open).
+    let meta_path = store_path.join("meta");
+    let mut bytes = std::fs::read(&meta_path).expect("replica meta image exists");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x5a;
+    std::fs::write(&meta_path, bytes).expect("corrupt store written");
 
     // The production composition root fails closed: a clean Io error naming
     // the corruption — no panic, and the node never finishes starting, so
@@ -648,12 +657,12 @@ async fn placement_node_start_fails_closed_on_corrupt_data_replica_store() {
         "error must name the corruption, got: {err}"
     );
 
-    // Janitor path removes the unrecoverable artifact (this previously
-    // failed: `remove_dir_all` cannot remove the single-file store layout).
+    // Janitor path removes the unrecoverable artifact (the M5 store is a
+    // directory, so `remove_dir_all` removes it directly).
     FsReplicaJanitor::new(data_dir.clone(), victim)
         .remove_local_replica(SHARD)
         .await
-        .expect("janitor removes the corrupt replica file");
+        .expect("janitor removes the corrupt replica directory");
     assert!(!store_path.exists(), "corrupt artifact must be gone");
 
     // Restart: the whole node comes back — catalog, both shards, every
