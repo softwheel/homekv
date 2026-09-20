@@ -314,6 +314,21 @@ async fn catalog_health_transitions_keep_view_well_formed() {
     .expect("node starts");
     let state = node.committed_state().await.expect("catalog readable");
 
+    // Stabilize: every hosted replica must have voted at least once
+    // (term >= 1) before the well-formedness assertions below, which
+    // require it. Under parallel-suite load the first election can lag
+    // behind node startup; a term-0 replica is legitimate transient
+    // state, not a malformed view.
+    wait_for(
+        || async {
+            let view = observe_topology(&node, &state, &SHARDS, CatalogHealth::Healthy).await;
+            view.groups.iter().all(|g| g.term >= 1).then_some(())
+        },
+        Duration::from_secs(30),
+        "replicas to reach term >= 1",
+    )
+    .await;
+
     let degraded = build_topology_view(
         &state,
         &BTreeSet::from([4u64]),
@@ -690,6 +705,10 @@ async fn production_snapshot_covers_section_9_fields() {
     // runtime.
     assert!(snap.runtime.sampled);
     assert_eq!(snap.runtime.num_workers, 4);
+    // Timers: the placement node owns exactly the drive + reconcile
+    // intervals (HomeKV-owned §9 "timer" signal; tokio's internal timer
+    // wheel is not observable via the stable API).
+    assert_eq!(snap.runtime.node_timers, 2);
 
     // Catalog identity matches the committed view.
     let state = node.committed_state().await.expect("catalog readable");

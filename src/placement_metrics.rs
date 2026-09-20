@@ -6,9 +6,12 @@
 //!
 //! What each §9 item maps to:
 //!
-//! - runtime workers/tasks/queue depth: [`RuntimeMetricsSnapshot`], sampled
-//!   from `tokio::runtime::Handle::current().metrics()`. Timer counts have
-//!   no `Handle` API and are not reported (documented gap, not invented).
+//! - runtime workers/tasks/timers/queue depth: [`RuntimeMetricsSnapshot`],
+//!   sampled from `tokio::runtime::Handle::current().metrics()` for workers
+//!   and tasks. Tokio's internal timer wheel has no stable `Handle` API, so
+//!   the timer signal is the HomeKV-owned count of timers the placement
+//!   node itself owns (`node_timers`: the drive + reconcile intervals) —
+//!   documented, not invented.
 //! - per-group role/term/config/commit/apply/snapshot/lag: one
 //!   [`ReplicaMetricsEntry`] per hosted replica, reusing the PR #89
 //!   [`GroupRaftView`](crate::rebalance::GroupRaftView) extraction via the
@@ -68,12 +71,13 @@ use crate::routing::RedirectCause;
 /// Groups share one bounded worker pool; this snapshot proves the OS-worker
 /// count stays at the configured bound as groups grow.
 ///
-/// Only `num_workers` and `num_alive_tasks` are reported: tokio's queue
-/// depth / blocking-thread counters require the `tokio_unstable` cfg, which
-/// this build does not enable, so they are documented gaps rather than
-/// invented numbers. Queue depth *is* observable where HomeKV owns the
-/// queue: per-peer in-flight RPC counts (`current`/`peak`) and
-/// backpressure rejections in [`PlacementRpcMetrics`].
+/// Only `num_workers` and `num_alive_tasks` are reported from tokio:
+/// tokio's queue depth / blocking-thread counters require the
+/// `tokio_unstable` cfg, which this build does not enable, so they are
+/// documented gaps rather than invented numbers. Queue depth *is*
+/// observable where HomeKV owns the queue: per-peer in-flight RPC counts
+/// (`current`/`peak`) and backpressure rejections in
+/// [`PlacementRpcMetrics`].
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimeMetricsSnapshot {
     /// False when sampled outside a Tokio runtime (never in production).
@@ -81,6 +85,11 @@ pub struct RuntimeMetricsSnapshot {
     /// Configured OS worker thread count.
     pub num_workers: usize,
     pub num_alive_tasks: usize,
+    /// Timers owned by the placement node itself (the drive loop's drive +
+    /// reconcile intervals). Tokio's internal timer wheel is not observable
+    /// through the stable API, so this HomeKV-owned count is the honest
+    /// "timer" signal for §9; it is set by [`PlacementNode`] at startup.
+    pub node_timers: u64,
 }
 
 /// Catalog identity for the snapshot.
@@ -237,6 +246,9 @@ fn sample_runtime() -> RuntimeMetricsSnapshot {
         sampled: true,
         num_workers: metrics.num_workers(),
         num_alive_tasks: metrics.num_alive_tasks(),
+        // The HomeKV-owned timer count is filled in by `metrics_snapshot`;
+        // `sample_runtime` alone cannot know the node's timers.
+        node_timers: 0,
     }
 }
 
@@ -396,8 +408,11 @@ impl PlacementNode {
             by_cause: redirect_snapshot.into_iter().collect(),
         };
 
+        let mut runtime = sample_runtime();
+        runtime.node_timers = self.owned_timers;
+
         Ok(PlacementMetrics {
-            runtime: sample_runtime(),
+            runtime,
             catalog,
             group_counts: GroupCountsSnapshot {
                 loaded,

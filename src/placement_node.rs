@@ -414,8 +414,18 @@ pub struct PlacementNode {
     pub(crate) observers: BTreeMap<DriverKey, HomeKvReplicaObserver>,
     pub(crate) redirect_metrics: RouteRedirectMetrics,
     pub(crate) shards: Vec<u16>,
+    /// Timers owned by this node (the drive loop's drive + reconcile
+    /// intervals). Surfaced in [`crate::placement_metrics::RuntimeMetricsSnapshot`]
+    /// as the HomeKV-owned §9 "timer" signal.
+    pub(crate) owned_timers: u64,
     drive_task: JoinHandle<()>,
 }
+
+/// Timers owned by the placement-node drive loop: the drive tick and the
+/// reconcile tick. Keep in sync with the `interval()` calls in
+/// [`PlacementNode::start`]; [`PlacementNode::owned_timers`] is set from
+/// this constant.
+const DRIVE_LOOP_TIMERS: u64 = 2;
 
 impl PlacementNode {
     /// Start the placement node: catalog group, data groups, per-shard
@@ -655,6 +665,8 @@ impl PlacementNode {
             let drive_interval = config.drive_interval;
             let reconcile_interval = config.reconcile_interval;
             tokio::spawn(async move {
+                // Exactly DRIVE_LOOP_TIMERS timers are owned here; keep the
+                // constant in sync if timers are added or removed.
                 let mut drive_tick = interval(drive_interval);
                 let mut reconcile_tick = interval(reconcile_interval);
                 loop {
@@ -715,6 +727,9 @@ impl PlacementNode {
             observers,
             redirect_metrics: RouteRedirectMetrics::default(),
             shards: config.shards.clone(),
+            // The drive task below creates exactly DRIVE_LOOP_TIMERS
+            // intervals; keep the constant in sync if that changes.
+            owned_timers: DRIVE_LOOP_TIMERS,
             drive_task,
         })
     }

@@ -1505,7 +1505,10 @@ async fn concurrent_multi_shard_histories_linearize_during_route_refresh() {
     for shard in SHARDS {
         wait_for(
             || async { node.group_leader(shard) },
-            Duration::from_secs(15),
+            // 60s matches the other leader waits in this file: under
+            // full-suite parallel load, elections on this VM can take
+            // far longer than the 150-300ms election timeouts suggest.
+            Duration::from_secs(60),
             "group leader",
         )
         .await;
