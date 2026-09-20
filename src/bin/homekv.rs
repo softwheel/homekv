@@ -209,6 +209,29 @@ struct Opt {
     // Defines the gossip sync interval
     #[arg(long = "gossip_interval", default_value = "500")]
     gossip_interval: u64,
+    /// Run the placement-node composition instead of the legacy server:
+    /// catalog Raft group, data Raft groups, and per-shard MovementDrivers
+    /// with a background drive loop (spec-0006 production wiring).
+    #[arg(long = "placement", default_value = "false")]
+    placement: bool,
+    /// Data directory for the placement node's Raft state.
+    #[arg(long = "placement_data_dir", default_value = "./homekv-placement")]
+    placement_data_dir: String,
+    /// Shards hosted by this placement node, e.g. "0,1,2" or "0-7".
+    #[arg(long = "placement_shards", default_value = "0")]
+    placement_shards: String,
+    /// Node identities hosted by this process, e.g. "1,2,3,4".
+    #[arg(long = "placement_node_ids", default_value = "1,2,3,4")]
+    placement_node_ids: String,
+    /// 16-byte cluster identity committed to the catalog at bootstrap.
+    #[arg(long = "placement_cluster_id", default_value = "homekv-place0001")]
+    placement_cluster_id: String,
+    /// Drive-loop catalog poll interval in milliseconds.
+    #[arg(long = "placement_drive_interval_ms", default_value = "1000")]
+    placement_drive_interval_ms: u64,
+    /// Local-replica reconciliation interval in milliseconds.
+    #[arg(long = "placement_reconcile_interval_ms", default_value = "5000")]
+    placement_reconcile_interval_ms: u64,
 }
 
 fn compact_limits(opt: &Opt) -> Result<(CodecLimits, RuntimeLimits), Box<dyn std::error::Error>> {
@@ -235,9 +258,93 @@ fn compact_limits(opt: &Opt) -> Result<(CodecLimits, RuntimeLimits), Box<dyn std
     Ok((codec_limits, runtime_limits))
 }
 
+/// Parse a shard list like "0,1,2" or "0-7" into sorted unique shard ids.
+fn parse_shards(spec: &str) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
+    let mut shards = std::collections::BTreeSet::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((lo, hi)) = part.split_once('-') {
+            let lo: u16 = lo.trim().parse()?;
+            let hi: u16 = hi.trim().parse()?;
+            if lo > hi {
+                return Err(format!("invalid shard range {part:?}").into());
+            }
+            for s in lo..=hi {
+                shards.insert(s);
+            }
+        } else {
+            shards.insert(part.parse::<u16>()?);
+        }
+    }
+    if shards.is_empty() {
+        return Err("placement_shards is empty".into());
+    }
+    Ok(shards.into_iter().collect())
+}
+
+fn parse_node_ids(spec: &str) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    let mut ids = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        ids.push(part.parse::<u64>()?);
+    }
+    if ids.len() < 3 {
+        return Err("placement_node_ids needs at least 3 identities".into());
+    }
+    Ok(ids)
+}
+
+/// `--placement` mode: run the production placement-node composition
+/// (catalog group + data groups + movement drivers + drive loop) until
+/// Ctrl-C.
+async fn run_placement(opt: Opt) -> Result<(), Box<dyn std::error::Error>> {
+    use homekv::placement_node::{PlacementNode, PlacementNodeConfig};
+    use std::time::Duration;
+
+    let cluster_bytes = opt.placement_cluster_id.as_bytes();
+    if cluster_bytes.len() != 16 {
+        return Err("placement_cluster_id must be exactly 16 bytes".into());
+    }
+    let mut cluster_id = [0u8; 16];
+    cluster_id.copy_from_slice(cluster_bytes);
+
+    let node_ids = parse_node_ids(&opt.placement_node_ids)?;
+    let config = PlacementNodeConfig {
+        node_ids: node_ids.clone(),
+        catalog_voters: [node_ids[0], node_ids[1], node_ids[2]],
+        data_dir: opt.placement_data_dir.into(),
+        cluster_id,
+        shards: parse_shards(&opt.placement_shards)?,
+        drive_interval: Duration::from_millis(opt.placement_drive_interval_ms),
+        reconcile_interval: Duration::from_millis(opt.placement_reconcile_interval_ms),
+        ..PlacementNodeConfig::default()
+    };
+    config.validate()?;
+
+    let node = PlacementNode::start(config).await?;
+    eprintln!("homekv placement node running; press Ctrl-C to stop");
+    // The tokio "signal" feature is not enabled in this workspace; block
+    // until killed. All Raft state is disk-backed, so a kill is crash-safe
+    // and recovery replays from the log on restart.
+    std::future::pending::<()>().await;
+    node.shutdown();
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::parse();
+
+    if opt.placement {
+        return run_placement(opt).await;
+    }
+
     let server_addr = format!("{}:{}", opt.host, opt.port).parse()?;
     let compact_addr: std::net::SocketAddr =
         format!("{}:{}", opt.compact_host, opt.compact_port).parse()?;

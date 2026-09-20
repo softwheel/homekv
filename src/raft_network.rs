@@ -242,6 +242,34 @@ impl HomeKvRaftNetworkFactory {
         self.local_id
     }
 
+    /// Factory for M4 placement data groups with warm-standby identities.
+    ///
+    /// Uses the extended bootstrap validation (endpoint hygiene without the
+    /// M3 voter-set pin) so identities beyond the three voters can host
+    /// replicas. M3's pinned [`HomeKvRaftNetworkFactory::new`] path is
+    /// unchanged.
+    pub fn new_extended(
+        local_id: RaftNodeId,
+        bootstrap: ThreeNodeBootstrap,
+        max_outstanding_per_peer: usize,
+        links: TestLinkController,
+    ) -> Result<Self, BootstrapError> {
+        bootstrap.validate_extended()?;
+        if !bootstrap.nodes.contains_key(&local_id) {
+            return Err(BootstrapError::UnknownPeer { node_id: local_id });
+        }
+        let limiter = PerPeerRpcLimiter::new(&bootstrap, max_outstanding_per_peer)?;
+        let metrics = RaftNetworkMetrics::new(&bootstrap, max_outstanding_per_peer);
+        Ok(Self {
+            local_id,
+            bootstrap: Arc::new(bootstrap),
+            limiter,
+            metrics,
+            links,
+            handlers: Arc::new(RwLock::new(BTreeMap::new())),
+        })
+    }
+
     pub fn metrics(&self) -> RaftNetworkMetricsSnapshot {
         self.metrics.snapshot()
     }
