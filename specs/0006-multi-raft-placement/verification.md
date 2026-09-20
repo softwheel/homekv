@@ -32,17 +32,17 @@ Retained evidence records:
 
 | Requirement | Required evidence | State |
 |---|---|---|
-| `REQ-M4-BASE-001..004` | per-group M3 boundary tests + complete unchanged M0-M3 regression gates | pending |
-| `REQ-M4-MAP-001` | XXH3 golden/property tests across all 1,024 shards and restart | pending |
-| `REQ-M4-MAP-002..003` | real catalog-group quorum/write/read/failover and authoritative-state tests | pending |
-| `REQ-M4-MAP-004..006` | RF=3/domain/skew/bootstrap/replay/corruption model tests | pending |
-| `REQ-M4-GROUP-001..006` | registry/runtime/transport bounds, recovery, fairness and isolation tests | pending |
-| `REQ-M4-ROUTE-001..005` | wrong-shard/member/leader, stale cached route and retry histories | pending |
-| `REQ-M4-MOVE-001..006` | phase, catch-up, membership, crash/retry/cancel and traffic histories | pending |
-| `REQ-M4-BAL-001..005` | deterministic planner, skew, bounded execution, gossip and catalog-loss tests | pending |
-| `REQ-M4-FAIL-001..004` | per-group/catalog/node loss, restart and corruption matrix | pending |
-| `REQ-M4-OPS-001..003` | stable topology/metrics/cardinality assertions during transitions | pending |
-| `REQ-M4-PERF-001..006` | retained complete many-group scaling bundles and adapter decision | pending |
+| `REQ-M4-BASE-001..004` | per-group M3 boundary tests + complete unchanged M0-M3 regression gates | pass (302/302 on `23d3d37`) |
+| `REQ-M4-MAP-001` | XXH3 golden/property tests across all 1,024 shards and restart | partial |
+| `REQ-M4-MAP-002..003` | real catalog-group quorum/write/read/failover and authoritative-state tests | pass (M4-T1 `m4_catalog_group.rs`) |
+| `REQ-M4-MAP-004..006` | RF=3/domain/skew/bootstrap/replay/corruption model tests | partial |
+| `REQ-M4-GROUP-001..006` | registry/runtime/transport bounds, recovery, fairness and isolation tests | partial |
+| `REQ-M4-ROUTE-001..005` | wrong-shard/member/leader, stale cached route and retry histories | pass (`m4_routing_histories.rs`, 12 tests) |
+| `REQ-M4-MOVE-001..006` | phase, catch-up, membership, crash/retry/cancel and traffic histories | pass (`m4_movement_matrix.rs`, 31 tests; `m4_placement_node.rs` end-to-end) |
+| `REQ-M4-BAL-001..005` | deterministic planner, skew, bounded execution, gossip and catalog-loss tests | partial: BAL-001 (planner skew ≤ 1 on resulting plans) not asserted; BAL-002..005 pass (`m4_failure_matrix.rs`) |
+| `REQ-M4-FAIL-001..004` | per-group/catalog/node loss, restart and corruption matrix | partial: FAIL-001..003 pass (`m4_failure_matrix.rs`); FAIL-004 catalog snapshots fail closed, data-group log corruption not covered |
+| `REQ-M4-OPS-001..003` | stable topology/metrics/cardinality assertions during transitions | partial: per-group Raft fields, stable views, bounded cardinality, health gate pass (`m4_observability_matrices.rs`, 6 tests); runtime workers/task-timer counts, connection/RPC metrics, memory accounting outside library observation surface |
+| `REQ-M4-PERF-001..006` | retained complete many-group scaling bundles and adapter decision | pass (three 1,024-group runs re-executed on `23d3d37`, 0 failures each; digests in `docs/m4t7-verification-evidence.md`) |
 
 ## 4. Mapping and catalog verification
 
