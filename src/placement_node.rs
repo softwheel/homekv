@@ -194,10 +194,15 @@ impl PlacementNodeConfig {
 }
 
 /// One hosted replica: the Raft handle plus its state machine.
+///
+/// The log store handle is retained so observability tooling (and tests)
+/// can observe live durable replica state; it shares the same underlying
+/// store as the Raft instance.
 #[derive(Clone)]
 struct Replica {
     raft: Raft<HomeKvRaftConfig>,
     state_machine: Arc<HomeKvStateMachine>,
+    log_store: HomeKvRaftLogStore,
 }
 
 /// Start all replicas for one Raft group (catalog or data group).
@@ -239,7 +244,7 @@ async fn start_replicas(
             *id,
             raft_config.clone(),
             factories[id].clone(),
-            store,
+            store.clone(),
             (*state_machine).clone(),
         )
         .await
@@ -249,6 +254,7 @@ async fn start_replicas(
             Replica {
                 raft,
                 state_machine,
+                log_store: store,
             },
         );
     }
@@ -623,6 +629,21 @@ impl PlacementNode {
             .get(&shard_id)
             .and_then(|replicas| replicas.get(&node_id))
             .map(|replica| replica.raft.clone())
+    }
+
+    /// The log store handle of a hosted replica (observability and tests).
+    ///
+    /// Shares the same underlying store as the replica's Raft instance, so
+    /// a replica observer built from it sees live durable state.
+    pub fn group_log_store(
+        &self,
+        shard_id: u16,
+        node_id: RaftNodeId,
+    ) -> Option<HomeKvRaftLogStore> {
+        self.groups
+            .get(&shard_id)
+            .and_then(|replicas| replicas.get(&node_id))
+            .map(|replica| replica.log_store.clone())
     }
 
     /// Stop the drive loop. Raft instances shut down on drop.
