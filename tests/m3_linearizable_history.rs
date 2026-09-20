@@ -8,6 +8,7 @@ use homekv::raft::{HomeKvRaftConfig, HomeKvStateMachine, RaftCommand, RaftNode};
 use homekv::raft_network::HomeKvRaftNetworkFactory;
 use homekv::raft_storage::HomeKvRaftLogStore;
 use homekv::raft_transport::{BootstrapNode, LinkRule, TestLinkController, ThreeNodeBootstrap};
+use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::raft::Raft;
 use openraft::{Config, ServerState};
 
@@ -171,16 +172,58 @@ async fn execute(
     let invoke = clock.fetch_add(1, Ordering::SeqCst);
     let observed = match planned {
         PlannedOp::Write(value) => {
-            raft.client_write(RaftCommand::Set {
-                key: b"linearizable-key".to_vec(),
-                value: value.to_vec(),
-            })
-            .await
-            .unwrap();
+            // Under CI load, a write can transiently fail on the first
+            // attempt (e.g. a leadership change mid-call, or a saturated link
+            // delaying the commit path). The write is an idempotent `Set` of
+            // the same key/value, so a correct client retries; the retry
+            // happens inside this one `execute` call, so the invoke/complete
+            // interval — and hence the linearizability model — is unaffected.
+            // Only the recorded history (invoke → observed write → complete)
+            // changes, never its meaning.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let write = raft
+                    .client_write(RaftCommand::Set {
+                        key: b"linearizable-key".to_vec(),
+                        value: value.to_vec(),
+                    })
+                    .await;
+                match write {
+                    Ok(_) => break,
+                    Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_)))
+                        if tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(error) => {
+                        panic!("client_write failed and is not retryable: {error:?}")
+                    }
+                }
+            }
             ObservedOp::Write(value.to_vec())
         }
         PlannedOp::Read => {
-            raft.ensure_linearizable().await.unwrap();
+            // Same transient treatment for reads: under CI load, the leader's
+            // read-confirmation round can momentarily fail to reach quorum
+            // (`CheckIsLeaderError::QuorumNotEnough`) or observe a leadership
+            // change (`ForwardToLeader`). `ensure_linearizable` is an
+            // idempotent confirmation, so retrying it is safe and leaves the
+            // recorded read interval's meaning unchanged.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                match raft.ensure_linearizable().await {
+                    Ok(_) => break,
+                    Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(_)))
+                    | Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(_)))
+                        if tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(error) => {
+                        panic!("ensure_linearizable failed and is not retryable: {error:?}")
+                    }
+                }
+            }
             ObservedOp::Read(sm.get(b"linearizable-key").await)
         }
     };

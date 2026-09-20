@@ -47,6 +47,7 @@ use homekv::rebalance::{
     RebalancePlan, RebalanceScheduler, RebalanceSchedulerConfig,
 };
 use movement_fakes::{CommandKind, FaultPoint, Harness, OP_ID, SHARD};
+use openraft::error::{ClientWriteError, RaftError};
 
 const SHARD_B: u16 = 8;
 
@@ -140,21 +141,57 @@ impl Cluster {
     }
 
     async fn write_via_leader(&self, shard_id: u16, key: &[u8], value: &[u8]) {
-        let leader_id = wait_for(
+        // The observed leader can change between `group_leader` and the
+        // write (the stale-leader race, especially right after a node
+        // restart). Per REQ-FAIL-003, requests to a stale leader MUST fail or
+        // redirect safely; a correct client follows the redirect hint (or
+        // re-observes when the hint is absent) and treats quorum loss as
+        // transient-retryable, rather than treating the first attempt as
+        // authoritative. The write is an idempotent `Set`, so retry is safe;
+        // assertions about committed state are unchanged.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut leader_id = wait_for(
             || async { self.node.group_leader(shard_id) },
             Duration::from_secs(20),
             "data-group leader",
         )
         .await;
-        self.node
-            .group_raft(shard_id, leader_id)
-            .expect("leader raft")
-            .client_write(RaftCommand::Set {
-                key: key.to_vec(),
-                value: value.to_vec(),
-            })
-            .await
-            .expect("write commits");
+        loop {
+            let write = self
+                .node
+                .group_raft(shard_id, leader_id)
+                .expect("leader raft")
+                .client_write(RaftCommand::Set {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                })
+                .await;
+            match write {
+                Ok(_) => return,
+                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward)))
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    leader_id = match forward.leader_id {
+                        Some(id) => id,
+                        None => {
+                            wait_for(
+                                || async { self.node.group_leader(shard_id) },
+                                Duration::from_secs(10),
+                                "data-group leader after redirect",
+                            )
+                            .await
+                        }
+                    };
+                }
+                // `client_write` in openraft 0.9.25 has no `QuorumNotEnough`
+                // variant: quorum loss just keeps the write pending until the
+                // commit lands, so no retry arm is needed (or possible) here.
+                Err(error) => {
+                    panic!("write to shard {shard_id} failed and is not retryable: {error:?}")
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     async fn shutdown_replica(&self, shard_id: u16, node_id: RaftNodeId) {
