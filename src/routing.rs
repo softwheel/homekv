@@ -21,7 +21,9 @@
 //! OpenRaft state machine: the resolver gates on committed membership only
 //! and never treats the catalog's advisory desired leader as authority.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_derive::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -78,6 +80,78 @@ pub enum RouteDecision {
     Unavailable,
 }
 
+/// Why a request was redirected or refused at the routing layer.
+///
+/// Spec 0006 §9 requires "route redirects by cause". The cause set is
+/// deliberately closed and tiny (bounded cardinality): it names the
+/// decision outcome, never the key, client, or shard.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum RedirectCause {
+    /// This node is not one of the shard's committed voters
+    /// ([`RouteDecision::Redirect`]).
+    NotCommittedVoter,
+    /// No committed placement is known for the shard yet
+    /// ([`RouteDecision::Unavailable`]).
+    NoCommittedPlacement,
+}
+
+#[derive(Debug, Default)]
+struct RouteRedirectMetricsInner {
+    not_committed_voter: AtomicU64,
+    no_committed_placement: AtomicU64,
+}
+
+/// Atomic redirect counters, shared by handle.
+///
+/// One handle is shared by every [`CommittedRouteResolver`] serving a node
+/// (the production [`PlacementNode`](crate::placement_node::PlacementNode)
+/// exposes its handle via
+/// [`route_redirect_metrics`](crate::placement_node::PlacementNode::route_redirect_metrics)),
+/// so the node's metrics snapshot reports the serving layer's redirects by
+/// cause. Recording is lock-free and never blocks the routing decision.
+#[derive(Clone, Debug, Default)]
+pub struct RouteRedirectMetrics {
+    inner: Arc<RouteRedirectMetricsInner>,
+}
+
+impl RouteRedirectMetrics {
+    /// Record one redirect/refusal by cause.
+    pub fn record(&self, cause: RedirectCause) {
+        match cause {
+            RedirectCause::NotCommittedVoter => {
+                self.inner
+                    .not_committed_voter
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            RedirectCause::NoCommittedPlacement => {
+                self.inner
+                    .no_committed_placement
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// By-cause counts, sorted by cause. Bounded: exactly one entry per
+    /// [`RedirectCause`]; no per-shard, per-key or per-client labels.
+    pub fn snapshot(&self) -> BTreeMap<RedirectCause, u64> {
+        BTreeMap::from([
+            (
+                RedirectCause::NotCommittedVoter,
+                self.inner.not_committed_voter.load(Ordering::Relaxed),
+            ),
+            (
+                RedirectCause::NoCommittedPlacement,
+                self.inner.no_committed_placement.load(Ordering::Relaxed),
+            ),
+        ])
+    }
+
+    /// Total recorded redirects/refusals across all causes.
+    pub fn total(&self) -> u64 {
+        self.snapshot().values().sum()
+    }
+}
+
 /// Resolves shard placement against the committed catalog view.
 ///
 /// The catalog handle is shared with the catalog runtime, which publishes
@@ -86,20 +160,51 @@ pub enum RouteDecision {
 pub struct CommittedRouteResolver {
     node_id: RaftNodeId,
     catalog: Arc<RwLock<PlacementCatalog>>,
+    redirect_metrics: RouteRedirectMetrics,
 }
 
 impl CommittedRouteResolver {
     pub fn new(node_id: RaftNodeId, catalog: Arc<RwLock<PlacementCatalog>>) -> Self {
-        Self { node_id, catalog }
+        Self::with_metrics(node_id, catalog, RouteRedirectMetrics::default())
+    }
+
+    /// Build a resolver sharing the node's redirect counters, so the §9
+    /// metrics surface observes the serving layer's redirects by cause.
+    pub fn with_metrics(
+        node_id: RaftNodeId,
+        catalog: Arc<RwLock<PlacementCatalog>>,
+        redirect_metrics: RouteRedirectMetrics,
+    ) -> Self {
+        Self {
+            node_id,
+            catalog,
+            redirect_metrics,
+        }
     }
 
     pub fn node_id(&self) -> RaftNodeId {
         self.node_id
     }
 
+    /// The shared redirect counters (cloned handle).
+    pub fn redirect_metrics(&self) -> RouteRedirectMetrics {
+        self.redirect_metrics.clone()
+    }
+
     pub async fn resolve(&self, shard_id: u16) -> RouteDecision {
         let catalog = self.catalog.read().await;
-        Self::decide(self.node_id, catalog.state(), shard_id)
+        let decision = Self::decide(self.node_id, catalog.state(), shard_id);
+        // The decision itself is unchanged; recording is a side counter.
+        match &decision {
+            RouteDecision::Redirect(_) => self
+                .redirect_metrics
+                .record(RedirectCause::NotCommittedVoter),
+            RouteDecision::Unavailable => self
+                .redirect_metrics
+                .record(RedirectCause::NoCommittedPlacement),
+            RouteDecision::Local { .. } => {}
+        }
+        decision
     }
 
     fn decide(node_id: RaftNodeId, state: Option<&CatalogState>, shard_id: u16) -> RouteDecision {

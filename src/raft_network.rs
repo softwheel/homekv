@@ -13,6 +13,7 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     Raft, VoteRequest, VoteResponse,
 };
+use openraft::EntryPayload;
 use serde_derive::{Deserialize, Serialize};
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -32,6 +33,15 @@ pub struct PeerRpcMetricsSnapshot {
     pub attempts: u64,
     pub failures: u64,
     pub backpressure_rejections: u64,
+    /// Serialized application payload bytes handed to the transport for this
+    /// peer (what a wire transport would carry; see
+    /// [`append_entries_payload_bytes`]). The in-process transport moves
+    /// values without wire encoding, so this is the honest byte signal it
+    /// can report: bincode-serialized command bytes for append-entries,
+    /// serialized vote requests, and raw snapshot chunk bytes for
+    /// install-snapshot. There are no sockets here, so this is not a
+    /// socket-byte count.
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -48,6 +58,7 @@ struct PeerRpcMetrics {
     attempts: AtomicU64,
     failures: AtomicU64,
     backpressure_rejections: AtomicU64,
+    bytes: AtomicU64,
 }
 
 impl PeerRpcMetrics {
@@ -75,6 +86,15 @@ impl PeerRpcMetrics {
         self.failed();
     }
 
+    /// Record payload bytes handed to the transport for one RPC. Counted
+    /// only after the RPC is admitted (rejected/unknown-peer attempts move
+    /// no bytes).
+    fn add_bytes(&self, bytes: u64) {
+        if bytes > 0 {
+            self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
     fn snapshot(&self) -> PeerRpcMetricsSnapshot {
         PeerRpcMetricsSnapshot {
             target_node_id: self.target_node_id,
@@ -84,6 +104,7 @@ impl PeerRpcMetrics {
             attempts: self.attempts.load(Ordering::Relaxed),
             failures: self.failures.load(Ordering::Relaxed),
             backpressure_rejections: self.backpressure_rejections.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -102,6 +123,10 @@ impl RpcAttempt {
     fn failed(&mut self) {
         self.metrics.failed();
         self.completed = true;
+    }
+
+    fn add_bytes(&self, bytes: u64) {
+        self.metrics.add_bytes(bytes);
     }
 }
 
@@ -136,6 +161,7 @@ impl RaftNetworkMetrics {
                         attempts: AtomicU64::new(0),
                         failures: AtomicU64::new(0),
                         backpressure_rejections: AtomicU64::new(0),
+                        bytes: AtomicU64::new(0),
                     }),
                 )
             })
@@ -392,13 +418,33 @@ impl RaftNetworkFactory<HomeKvRaftConfig> for HomeKvRaftNetworkFactory {
     }
 }
 
+/// Serialized application payload bytes for one append-entries batch.
+///
+/// The in-process transport moves values without wire encoding, so this
+/// counts the bincode-serialized application commands — the bytes a wire
+/// transport would carry. Heartbeats (no entries), blank entries and
+/// membership entries carry no application payload.
+fn append_entries_payload_bytes(req: &AppendEntriesRequest<HomeKvRaftConfig>) -> u64 {
+    req.entries
+        .iter()
+        .filter_map(|entry| match &entry.payload {
+            EntryPayload::Normal(command) => bincode::serialized_size(command).ok(),
+            EntryPayload::Blank | EntryPayload::Membership(_) => None,
+        })
+        .sum()
+}
+
 impl RaftNetwork<HomeKvRaftConfig> for HomeKvRaftNetworkConnection {
     async fn append_entries(
         &mut self,
         req: AppendEntriesRequest<HomeKvRaftConfig>,
         _option: RPCOption,
     ) -> RpcResult<AppendEntriesResponse<RaftNodeId>> {
-        let (mut attempt, handler) = self.before_rpc().await?;
+        let (attempt, handler) = self.before_rpc().await?;
+        // Bytes are counted once the RPC is admitted: rejected attempts and
+        // unknown-peer attempts move no bytes.
+        attempt.add_bytes(append_entries_payload_bytes(&req));
+        let mut attempt = attempt;
         match handler.append_entries(req).await {
             Ok(response) => {
                 attempt.succeeded();
@@ -416,7 +462,9 @@ impl RaftNetwork<HomeKvRaftConfig> for HomeKvRaftNetworkConnection {
         req: VoteRequest<RaftNodeId>,
         _option: RPCOption,
     ) -> RpcResult<VoteResponse<RaftNodeId>> {
-        let (mut attempt, handler) = self.before_rpc().await?;
+        let (attempt, handler) = self.before_rpc().await?;
+        attempt.add_bytes(bincode::serialized_size(&req).unwrap_or(0));
+        let mut attempt = attempt;
         match handler.vote(req).await {
             Ok(response) => {
                 attempt.succeeded();
@@ -435,7 +483,11 @@ impl RaftNetwork<HomeKvRaftConfig> for HomeKvRaftNetworkConnection {
         req: InstallSnapshotRequest<HomeKvRaftConfig>,
         _option: RPCOption,
     ) -> RpcResult<InstallSnapshotResponse<RaftNodeId>, RaftError<RaftNodeId, InstallSnapshotError>> {
-        let (mut attempt, handler) = self.before_rpc().await?;
+        let (attempt, handler) = self.before_rpc().await?;
+        // The snapshot chunk bytes are the real payload; vote/meta framing
+        // is fixed overhead and is not counted.
+        attempt.add_bytes(req.data.len() as u64);
+        let mut attempt = attempt;
         match handler.install_snapshot(req).await {
             Ok(response) => {
                 attempt.succeeded();
@@ -454,7 +506,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::raft::RaftCommand;
     use crate::raft_transport::BootstrapNode;
+    use openraft::{CommittedLeaderId, Entry, LogId, Vote};
 
     fn bootstrap() -> ThreeNodeBootstrap {
         ThreeNodeBootstrap::new(
@@ -474,6 +528,41 @@ mod tests {
             .iter()
             .find(|peer| peer.target_node_id == node_id)
             .unwrap()
+    }
+
+    #[test]
+    fn append_entries_payload_bytes_counts_only_application_commands() {
+        fn log_id(index: u64) -> LogId<RaftNodeId> {
+            LogId::new(CommittedLeaderId::new(1, 1), index)
+        }
+        fn request(entries: Vec<Entry<HomeKvRaftConfig>>) -> AppendEntriesRequest<HomeKvRaftConfig> {
+            AppendEntriesRequest {
+                vote: Vote::new(1, 1),
+                prev_log_id: None,
+                entries,
+                leader_commit: None,
+            }
+        }
+
+        let command = RaftCommand::Set {
+            key: b"byte-key".to_vec(),
+            value: b"byte-value".to_vec(),
+        };
+        let expected = bincode::serialized_size(&command).unwrap();
+        let batch = request(vec![
+            Entry {
+                log_id: log_id(1),
+                payload: EntryPayload::Normal(command),
+            },
+            Entry {
+                log_id: log_id(2),
+                payload: EntryPayload::Blank,
+            },
+        ]);
+        assert_eq!(append_entries_payload_bytes(&batch), expected);
+
+        // Heartbeats carry no entries and move no application bytes.
+        assert_eq!(append_entries_payload_bytes(&request(vec![])), 0);
     }
 
     #[test]
@@ -539,6 +628,9 @@ mod tests {
         assert_eq!(saturated.attempts, 2);
         assert_eq!(saturated.failures, 1);
         assert_eq!(saturated.backpressure_rejections, 1);
+        // Admission-only attempts move no payload bytes: byte accounting
+        // starts once an RPC is admitted and carries application data.
+        assert_eq!(saturated.bytes, 0);
         assert!(!serde_json::to_string(&snapshot)
             .unwrap()
             .contains("openraft"));
