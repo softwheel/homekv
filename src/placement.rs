@@ -159,6 +159,16 @@ pub enum CatalogCommand {
         observed_voters: [RaftNodeId; 3],
         reason: String,
     },
+    /// Reassign the advisory desired-leader hint for one shard
+    /// (REQ-M4-BAL-001 leader distribution). Applies only when
+    /// `new_leader` is a stable voter of the shard and no movement is
+    /// active; the global epoch is bumped so route versions observe the
+    /// change. Idempotent when the hint is already set.
+    SetDesiredLeader {
+        expected_epoch: PlacementEpoch,
+        shard_id: u16,
+        new_leader: RaftNodeId,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -171,6 +181,8 @@ pub enum CatalogResponse {
     AttemptRecorded { retries: u32 },
     MovementPublished { placement_epoch: PlacementEpoch },
     MovementCancelled,
+    DesiredLeaderUpdated { placement_epoch: PlacementEpoch },
+    DesiredLeaderAlreadySet,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -396,6 +408,11 @@ impl PlacementCatalog {
                 observed_voters,
                 reason,
             ),
+            CatalogCommand::SetDesiredLeader {
+                expected_epoch,
+                shard_id,
+                new_leader,
+            } => self.set_desired_leader(expected_epoch, shard_id, new_leader),
         }
     }
 
@@ -713,6 +730,53 @@ impl PlacementCatalog {
         // guessing which placement is authoritative (REQ-M4-MOVE-004).
         Err(PlacementError::AmbiguousMembership { shard_id })
     }
+
+    /// Reassign the advisory desired-leader hint for one shard.
+    ///
+    /// The hint never confers authority (REQ-M4-ROUTE-003); it only steers
+    /// clients toward a balanced leader. The command is rejected while a
+    /// movement is active on the shard so it cannot race the driver's own
+    /// desired-leader maintenance at publish time, and it requires the
+    /// new leader to be a stable voter so the hint always names a real
+    /// replica (REQ-M4-BAL-001).
+    fn set_desired_leader(
+        &mut self,
+        expected_epoch: PlacementEpoch,
+        shard_id: u16,
+        new_leader: RaftNodeId,
+    ) -> Result<CatalogResponse, PlacementError> {
+        let state = self.movement_state(expected_epoch, shard_id)?;
+        let placement = state
+            .placements
+            .get(&shard_id)
+            .expect("movement_state validated the shard");
+        if placement.pending_movement.is_some() {
+            return Err(PlacementError::ConflictingMovement { shard_id });
+        }
+        if !placement.voters.contains(&new_leader) {
+            return Err(PlacementError::InvalidMovementTarget {
+                shard_id,
+                reason: format!("desired leader {new_leader} is not a stable voter"),
+            });
+        }
+        if placement.desired_leader == new_leader {
+            return Ok(CatalogResponse::DesiredLeaderAlreadySet);
+        }
+        let new_epoch = state
+            .placement_epoch
+            .checked_add(1)
+            .ok_or(PlacementError::EpochExhausted)?;
+        let placement = state
+            .placements
+            .get_mut(&shard_id)
+            .expect("movement_state validated the shard");
+        placement.desired_leader = new_leader;
+        placement.epoch = new_epoch;
+        state.placement_epoch = new_epoch;
+        Ok(CatalogResponse::DesiredLeaderUpdated {
+            placement_epoch: new_epoch,
+        })
+    }
 }
 
 impl CatalogState {
@@ -859,7 +923,7 @@ fn validate_node(node: &EligibleNode) -> Result<(), PlacementError> {
     Ok(())
 }
 
-fn validate_voters(
+pub(crate) fn validate_voters(
     shard_id: u16,
     voters: &[RaftNodeId; 3],
     nodes: &BTreeMap<RaftNodeId, EligibleNode>,
@@ -1257,11 +1321,9 @@ mod tests {
         target.sort_unstable();
         (
             stable,
-            target
-                .try_into()
-                .unwrap_or_else(|voters: Vec<RaftNodeId>| {
-                    panic!("exactly three target voters, got {}", voters.len())
-                }),
+            target.try_into().unwrap_or_else(|voters: Vec<RaftNodeId>| {
+                panic!("exactly three target voters, got {}", voters.len())
+            }),
         )
     }
 
@@ -1817,5 +1879,91 @@ mod tests {
         assert_eq!(restored, catalog);
         assert_eq!(pending(&restored, 5).unwrap().phase, MovementPhase::Learner);
         assert_eq!(pending(&restored, 5).unwrap().retries, 1);
+    }
+
+    fn set_leader(
+        catalog: &mut PlacementCatalog,
+        expected_epoch: PlacementEpoch,
+        shard_id: u16,
+        new_leader: RaftNodeId,
+    ) -> Result<CatalogResponse, PlacementError> {
+        catalog.apply(CatalogCommand::SetDesiredLeader {
+            expected_epoch,
+            shard_id,
+            new_leader,
+        })
+    }
+
+    #[test]
+    fn set_desired_leader_updates_hint_and_bumps_epoch() {
+        let mut catalog = four_node_catalog();
+        let (current, voters) = {
+            let state = catalog.state().unwrap();
+            let placement = state.placements.get(&3).unwrap();
+            (placement.desired_leader, placement.voters)
+        };
+        let replacement = voters
+            .iter()
+            .copied()
+            .find(|node| *node != current)
+            .unwrap();
+        let response = set_leader(&mut catalog, 1, 3, replacement).unwrap();
+        assert!(matches!(
+            response,
+            CatalogResponse::DesiredLeaderUpdated { placement_epoch: 2 }
+        ));
+        let state = catalog.state().unwrap();
+        assert_eq!(state.placement_epoch, 2);
+        let placement = state.placements.get(&3).unwrap();
+        assert_eq!(placement.desired_leader, replacement);
+        assert_eq!(placement.epoch, 2);
+        // Stable voters are untouched; only the advisory hint changed.
+        assert_eq!(placement.voters, voters);
+        // Idempotent retry does not bump the epoch again.
+        assert!(matches!(
+            set_leader(&mut catalog, 2, 3, replacement).unwrap(),
+            CatalogResponse::DesiredLeaderAlreadySet
+        ));
+        assert_eq!(catalog.state().unwrap().placement_epoch, 2);
+    }
+
+    #[test]
+    fn set_desired_leader_rejects_non_voter_stale_epoch_and_active_movement() {
+        let mut catalog = four_node_catalog();
+        let (voters_of_3, non_voter) = {
+            let state = catalog.state().unwrap();
+            let placement = state.placements.get(&3).unwrap();
+            let voters = placement.voters;
+            let non_voter = state
+                .eligible_nodes
+                .keys()
+                .copied()
+                .find(|node| !voters.contains(node))
+                .unwrap();
+            (voters, non_voter)
+        };
+        assert!(matches!(
+            set_leader(&mut catalog, 1, 3, non_voter),
+            Err(PlacementError::InvalidMovementTarget { shard_id: 3, .. })
+        ));
+        assert!(matches!(
+            set_leader(&mut catalog, 999, 3, voters_of_3[0]),
+            Err(PlacementError::StaleCatalogView { .. })
+        ));
+
+        let (_stable, target) = movement_target(&catalog, 5, {
+            let state = catalog.state().unwrap();
+            state.placements.get(&5).unwrap().voters[2]
+        });
+        begin(&mut catalog, op_id(9), 5, target).unwrap();
+        let other_voter = target
+            .iter()
+            .copied()
+            .find(|node| *node != target[0])
+            .unwrap();
+        assert!(matches!(
+            set_leader(&mut catalog, 1, 5, other_voter),
+            Err(PlacementError::ConflictingMovement { shard_id: 5 })
+        ));
     }
 }
