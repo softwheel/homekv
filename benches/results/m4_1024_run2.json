@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "mode": "bench",
-  "generated_at_unix_ms": 1789888720634,
+  "generated_at_unix_ms": 1789898472555,
   "authoritative_performance_result": false,
   "groups": 1024,
   "replication_factor": 3,
@@ -10,7 +10,7 @@
   "openraft_version": "0.9 (pinned via Cargo.lock)",
   "seed": 20260920,
   "environment": {
-    "homekv_git_sha": "23d3d37b1c47b06a16b4c9ca4bf73797a224d169",
+    "homekv_git_sha": "3033c18d07273ef63b3b656bbd51b43c9d822ea7",
     "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
     "os": "linux",
     "arch": "x86_64",
@@ -22,49 +22,49 @@
   "resource_samples": [
     {
       "label": "process-start",
-      "rss_bytes": 4882432,
+      "rss_bytes": 4956160,
       "tokio_workers": 2,
       "groups": 1024,
       "raft_instances": 3072
     },
     {
       "label": "cluster-built",
-      "rss_bytes": 151642112,
+      "rss_bytes": 150392832,
       "tokio_workers": 2,
       "groups": 1024,
       "raft_instances": 3072
     },
     {
       "label": "leaders-elected",
-      "rss_bytes": 158261248,
+      "rss_bytes": 157597696,
       "tokio_workers": 2,
       "groups": 1024,
       "raft_instances": 3072
     },
     {
       "label": "preloaded",
-      "rss_bytes": 333312000,
+      "rss_bytes": 333733888,
       "tokio_workers": 2,
       "groups": 1024,
       "raft_instances": 3072
     },
     {
       "label": "idle-complete",
-      "rss_bytes": 350978048,
+      "rss_bytes": 355057664,
       "tokio_workers": 2,
       "groups": 1024,
       "raft_instances": 3072
     },
     {
       "label": "workload-cells-complete",
-      "rss_bytes": 388853760,
+      "rss_bytes": 392376320,
       "tokio_workers": 2,
       "groups": 1024,
       "raft_instances": 3072
     },
     {
       "label": "fault-cells-complete",
-      "rss_bytes": 658059264,
+      "rss_bytes": 673030144,
       "tokio_workers": 2,
       "groups": 1024,
       "raft_instances": 3072
@@ -80,13 +80,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 10017580,
-      "throughput_ops_sec": 49912.25425701617,
+      "elapsed_ns": 9161124,
+      "throughput_ops_sec": 54578.45565675129,
       "latency": {
-        "p50_ns": 16956,
-        "p95_ns": 25418,
-        "p99_ns": 31387,
-        "p999_ns": 991969
+        "p50_ns": 17125,
+        "p95_ns": 27271,
+        "p99_ns": 31988,
+        "p999_ns": 105078
       }
     },
     {
@@ -98,13 +98,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 6742412,
-      "throughput_ops_sec": 74157.43802069646,
+      "elapsed_ns": 5327368,
+      "throughput_ops_sec": 93854.97679154134,
       "latency": {
-        "p50_ns": 86089,
-        "p95_ns": 129224,
-        "p99_ns": 397597,
-        "p999_ns": 663556
+        "p50_ns": 78819,
+        "p95_ns": 96985,
+        "p99_ns": 161002,
+        "p999_ns": 279380
       }
     },
     {
@@ -116,13 +116,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 147085875,
-      "throughput_ops_sec": 3399.3746850266893,
+      "elapsed_ns": 110194218,
+      "throughput_ops_sec": 4537.44315332407,
       "latency": {
-        "p50_ns": 238117,
-        "p95_ns": 520602,
-        "p99_ns": 1273001,
-        "p999_ns": 11141768
+        "p50_ns": 155233,
+        "p95_ns": 287472,
+        "p99_ns": 371367,
+        "p999_ns": 17725071
       }
     },
     {
@@ -134,13 +134,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 134484285,
-      "throughput_ops_sec": 3717.9065197097193,
+      "elapsed_ns": 136498309,
+      "throughput_ops_sec": 3663.0490418749437,
       "latency": {
-        "p50_ns": 1385160,
-        "p95_ns": 3204541,
-        "p99_ns": 22146619,
-        "p999_ns": 25195477
+        "p50_ns": 1338719,
+        "p95_ns": 3056028,
+        "p99_ns": 21740390,
+        "p999_ns": 27692746
       }
     },
     {
@@ -152,13 +152,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 155948410,
-      "throughput_ops_sec": 3206.1885081098294,
+      "elapsed_ns": 123297631,
+      "throughput_ops_sec": 4055.2279548663832,
       "latency": {
-        "p50_ns": 193059,
-        "p95_ns": 422344,
-        "p99_ns": 765729,
-        "p999_ns": 22557917
+        "p50_ns": 174412,
+        "p95_ns": 312008,
+        "p99_ns": 518949,
+        "p999_ns": 19904714
       }
     },
     {
@@ -170,13 +170,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 153966414,
-      "throughput_ops_sec": 3247.461488581529,
+      "elapsed_ns": 128060351,
+      "throughput_ops_sec": 3904.4091016117864,
       "latency": {
-        "p50_ns": 1325019,
-        "p95_ns": 4407948,
-        "p99_ns": 25027825,
-        "p999_ns": 25363458
+        "p50_ns": 1279431,
+        "p95_ns": 3530100,
+        "p99_ns": 24491119,
+        "p999_ns": 25706193
       }
     },
     {
@@ -188,13 +188,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 57510762,
-      "throughput_ops_sec": 8694.024954842365,
+      "elapsed_ns": 44783004,
+      "throughput_ops_sec": 11164.949988616218,
       "latency": {
-        "p50_ns": 25478,
-        "p95_ns": 390276,
-        "p99_ns": 1090947,
-        "p999_ns": 2840905
+        "p50_ns": 24276,
+        "p95_ns": 270596,
+        "p99_ns": 371708,
+        "p999_ns": 12609430
       }
     },
     {
@@ -206,13 +206,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 27655339,
-      "throughput_ops_sec": 18079.69159228169,
+      "elapsed_ns": 28151675,
+      "throughput_ops_sec": 17760.93252000103,
       "latency": {
-        "p50_ns": 272939,
-        "p95_ns": 1111378,
-        "p99_ns": 1707263,
-        "p999_ns": 3040254
+        "p50_ns": 323085,
+        "p95_ns": 1076226,
+        "p99_ns": 1569876,
+        "p999_ns": 1884930
       }
     },
     {
@@ -224,13 +224,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 8052109,
-      "throughput_ops_sec": 62095.53298396731,
+      "elapsed_ns": 7840611,
+      "throughput_ops_sec": 63770.540331614466,
       "latency": {
-        "p50_ns": 15063,
-        "p95_ns": 21702,
-        "p99_ns": 31617,
-        "p999_ns": 39059
+        "p50_ns": 14842,
+        "p95_ns": 20581,
+        "p99_ns": 26650,
+        "p999_ns": 31788
       }
     },
     {
@@ -242,13 +242,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 6723103,
-      "throughput_ops_sec": 74370.42092022092,
+      "elapsed_ns": 18227446,
+      "throughput_ops_sec": 27431.160679340373,
       "latency": {
-        "p50_ns": 81082,
-        "p95_ns": 194773,
-        "p99_ns": 578859,
-        "p999_ns": 842966
+        "p50_ns": 56695,
+        "p95_ns": 117877,
+        "p99_ns": 13559267,
+        "p999_ns": 13589413
       }
     },
     {
@@ -260,13 +260,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 162754418,
-      "throughput_ops_sec": 3072.113225215183,
+      "elapsed_ns": 212371210,
+      "throughput_ops_sec": 2354.3680897236495,
       "latency": {
-        "p50_ns": 214613,
-        "p95_ns": 488934,
-        "p99_ns": 2558401,
-        "p999_ns": 13407700
+        "p50_ns": 285229,
+        "p95_ns": 1079571,
+        "p99_ns": 2891511,
+        "p999_ns": 4855981
       }
     },
     {
@@ -278,13 +278,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 159720503,
-      "throughput_ops_sec": 3130.468478426968,
+      "elapsed_ns": 154322880,
+      "throughput_ops_sec": 3239.9602703111814,
       "latency": {
-        "p50_ns": 1355354,
-        "p95_ns": 4060075,
-        "p99_ns": 24328525,
-        "p999_ns": 25033784
+        "p50_ns": 1915696,
+        "p95_ns": 6090734,
+        "p99_ns": 8794233,
+        "p999_ns": 13407368
       }
     },
     {
@@ -296,13 +296,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 152218800,
-      "throughput_ops_sec": 3284.745379677149,
+      "elapsed_ns": 226382996,
+      "throughput_ops_sec": 2208.646447986756,
       "latency": {
-        "p50_ns": 213310,
-        "p95_ns": 417427,
-        "p99_ns": 1306872,
-        "p999_ns": 18310069
+        "p50_ns": 306370,
+        "p95_ns": 1631710,
+        "p99_ns": 2356948,
+        "p999_ns": 3439945
       }
     },
     {
@@ -314,13 +314,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 176798152,
-      "throughput_ops_sec": 2828.08385915708,
+      "elapsed_ns": 258147765,
+      "throughput_ops_sec": 1936.8751846447324,
       "latency": {
-        "p50_ns": 1427253,
-        "p95_ns": 6049142,
-        "p99_ns": 23728744,
-        "p999_ns": 24347143
+        "p50_ns": 3348467,
+        "p95_ns": 9173282,
+        "p99_ns": 19813536,
+        "p999_ns": 33421086
       }
     },
     {
@@ -332,13 +332,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 52192398,
-      "throughput_ops_sec": 9579.939208771362,
+      "elapsed_ns": 41819435,
+      "throughput_ops_sec": 11956.163444102007,
       "latency": {
-        "p50_ns": 21021,
-        "p95_ns": 289274,
-        "p99_ns": 354352,
-        "p999_ns": 19195278
+        "p50_ns": 21131,
+        "p95_ns": 342033,
+        "p99_ns": 438127,
+        "p999_ns": 994814
       }
     },
     {
@@ -350,13 +350,13 @@
       "attempted_operations": 500,
       "successful_operations": 500,
       "failures": 0,
-      "elapsed_ns": 25837671,
-      "throughput_ops_sec": 19351.5893905453,
+      "elapsed_ns": 78776400,
+      "throughput_ops_sec": 6347.07856667733,
       "latency": {
-        "p50_ns": 267712,
-        "p95_ns": 1058950,
-        "p99_ns": 1424509,
-        "p999_ns": 2491351
+        "p50_ns": 503806,
+        "p95_ns": 3472193,
+        "p99_ns": 4656291,
+        "p999_ns": 6834020
       }
     }
   ],
@@ -366,7 +366,7 @@
       "description": "group 0 fully partitioned (links dropped) while remaining groups serve read80_write20",
       "healthy_groups_ops": 500,
       "healthy_groups_failures": 0,
-      "healthy_groups_p99_ns": 3486003,
+      "healthy_groups_p99_ns": 1563948,
       "affected_group_ops": 20,
       "affected_group_failures": 20,
       "notes": [
@@ -379,7 +379,7 @@
       "description": "group 1 links delayed 250ms while remaining groups serve linearizable gets",
       "healthy_groups_ops": 500,
       "healthy_groups_failures": 0,
-      "healthy_groups_p99_ns": 86099,
+      "healthy_groups_p99_ns": 437437,
       "affected_group_ops": 0,
       "affected_group_failures": 0,
       "notes": [
@@ -391,7 +391,7 @@
       "description": "group 2 undergoes membership movement 3->2->3 while remaining groups serve",
       "healthy_groups_ops": 500,
       "healthy_groups_failures": 0,
-      "healthy_groups_p99_ns": 1381404,
+      "healthy_groups_p99_ns": 915454,
       "affected_group_ops": 0,
       "affected_group_failures": 0,
       "notes": [
@@ -404,8 +404,8 @@
     "Reads use ensure_linearizable before state access (quorum-backed linearizable).",
     "Each group is an independent 3-voter Raft cluster with ids {1,2,3} per M3 bootstrap contract.",
     "Results are engineering/regression characterization only, not public release performance claims (REQ-M4-PERF-005).",
-    "cluster build: 1024 groups (3072 raft instances) in 0.6s",
-    "leader election converged for 1024 groups in 0.5s",
+    "cluster build: 1024 groups (3072 raft instances) in 0.4s",
+    "leader election converged for 1024 groups in 0.6s",
     "smoke: 8192 quorum writes + linearizable reads across 1024 groups, 0 failures",
     "idle cell (5s, no workload): 0 leader changes across 1024 groups"
   ]

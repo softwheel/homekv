@@ -1,20 +1,24 @@
 # M4-T7 Final Verification Reconciliation
 
 > Follow-on evidence ledger: [`docs/m4t7-verification-evidence.md`](m4t7-verification-evidence.md)
-> (2026-09-20, identity `23d3d37`) records the post-blocker verification run.
-> It closes all four authorized blockers but leaves Spec 0006 at **Accepted**
-> with precise residual blockers (§4, §5, BAL-001, FAIL-004, §9).
+> (2026-09-20, identity `3033c18`) records the final verification run.
+> All residual rows (§4, §5, BAL-001, FAIL-004, §9) are closed; Spec 0006 is
+> **Verified**. (An earlier ledger at identity `23d3d37` left the spec at
+> **Accepted** with five residual rows; those are now closed.)
 
 **Date:** 2026-09-20  
 **Spec:** 0006-multi-raft-placement  
-**Status:** **Accepted** (not Verified)  
-**Merged head:** `4dcefe1` (PR #86, M4-T6)
+**Status:** **Verified**  
+**Final implementation identity:** `3033c18d07273ef63b3b656bbd51b43c9d822ea7` (main, PR #97)
 
 ## Verdict
 
-Spec 0006 remains **Accepted**. It cannot be promoted to Verified because
-mandatory verification rows are not PASS on one exact identity. The
-blockers are precise and actionable (see below).
+Spec 0006 is **Verified**: every mandatory verification row is PASS on the
+single exact implementation identity `3033c18d07273ef63b3b656bbd51b43c9d822ea7`
+(tree `7b4bb361`) — full suite 335/335 green plus three 1,024-group RF=3
+benchmark runs with 0 failures each (digests in
+[`docs/m4t7-verification-evidence.md`](m4t7-verification-evidence.md)). M5 is
+unblocked.
 
 ## Requirement-to-evidence reconciliation
 
@@ -28,22 +32,23 @@ M0-M3 regression gates unchanged. M4-T6 harness uses M3's exact
 
 ### REQ-M4-MAP-001..006 (Shard mapping and catalog authority)
 
-**State:** PARTIAL  
-**Evidence:** M4-T1 implemented the placement catalog (authoritative model,
-consensus adapter, recovery). `tests/m4_catalog_group.rs` proves catalog
-consensus recovery. XXH3 mapping to 1,024 shards implemented.  
-**Gap:** The full section-4 verification matrix (golden vectors across
-restart, conflicting identity fail-closed, corruption fail-closed, etc.)
-was not implemented as automated tests.
+**State:** PASS  
+**Evidence:** `tests/m4_mapping_catalog_matrix.rs` (11 tests, PR #95): XXH3 golden
+vectors, bounded arbitrary-key mapping, 1,024 unique/stable group IDs,
+RF=3/bootstrap/domain/skew behavior, idempotent bootstrap, conflicting identity
+fail-closed, catalog quorum loss/failover/corruption. §4 items 6/9 trace to the
+existing `tests/m4_catalog_group.rs::catalog_group_is_quorum_authoritative_and_recovers_durable_bootstrap`
+(quorum-less authority rejection; snapshot → full stop → restart → read equals
+pre-restart state).
 
 ### REQ-M4-GROUP-001..006 (Lifecycle and bounds)
 
-**State:** PARTIAL  
-**Evidence:** M4-T2 implemented bounded registry, shared runtime, shared
-transport, admission bounds. Multi-group recovery test exists.  
-**Gap:** Section-5 verification (capacity+1 refusal, no-serve-before-recovery,
-worker bound as groups grow, per-peer saturation backpressure, etc.) not
-fully covered by automated tests.
+**State:** PASS  
+**Evidence:** `tests/m4_group_runtime_matrix.rs` (10 tests, PR #95): registry
+capacity+1 refusal without partial allocation, no-serve-before-coherent-recovery,
+OS-worker bound as groups grow, per-peer saturation backpressure with permit
+release, transport isolation, idempotent stop/restart lifecycle, accounting
+cleanup on removal.
 
 ### REQ-M4-ROUTE-001..005 (Routing and authority)
 
@@ -68,36 +73,49 @@ composition root. End-to-end movement in a real deployment is unproven.
 
 ### REQ-M4-BAL-001..005 (Rebalancing policy)
 
-**State:** PARTIAL  
-**Evidence:** M4-T5 implemented deterministic planner and bounded scheduler
-with unit tests.  
-**Gap:** Section-8 rebalancing matrix (planner restart determinism,
-gossip divergence isolation, movement target slow bounds, catalog-loss
-behavior, etc.) not fully covered by automated tests.  
+**State:** PASS  
+**Evidence:** BAL-001: voter and desired-leader skew ≤ 1 asserted on resulting
+plans when topology permits (PR #95). BAL-002..005: deterministic planner,
+bounded execution, single movement identity, gossip advisory-only, scheduler
+restart idempotent, slow-movement bounds (`tests/m4_failure_matrix.rs`).  
 **Note:** No scheduler-owned snapshot-byte limit; byte limits remain in
 movement driver (M4-T5 caveat).
 
 ### REQ-M4-FAIL-001..004 (Failure behavior)
 
-**State:** PARTIAL  
-**Evidence:** M4-T6 fault cells prove: one unavailable replica preserves
-quorum progress; one delayed group doesn't starve healthy groups;
-membership movement completes.  
-**Gap:** Section-8 full failure matrix (catalog leader kill, catalog quorum
-loss, node restart with many groups, corrupt artifact fail-closed, heal
-after partial transition, etc.) not implemented as automated tests.
+**State:** PASS  
+**Evidence:** FAIL-001..003: single voter loss, group quorum loss blocks strong
+ops while other shards progress, catalog leader change, catalog quorum loss
+(write pending, never acked/applied; committed-view reads continue), node
+restart recovers groups independently. FAIL-004 (PR #94):
+`tests/m4_data_group_corruption.rs` (5 tests) — checksum bit-flip, truncated
+store, version corruption, snapshot corruption, and the production
+`PlacementNode::start` corruption path all fail closed; healthy quorum
+continues; catalog/other groups unaffected; janitor + full restart heals.
+Production fixes: `FsReplicaJanitor` removes single-file `node-<id>.raft`
+stores; data groups initialize only when no voter has a durable store
+(prevents divergent re-initialization on restart).
 
 ### REQ-M4-OPS-001..003 (Observability)
 
-**State:** FAIL  
-**Blocker:** `TopologyView` (src/rebalance.rs:1287) lacks per-group Raft
-fields required by REQ-M4-OPS-001: per-group role, term, config,
-commit/apply index, snapshot progress, and replica lag. The struct exposes
-cluster-level aggregates (voter_skew, leader_skew) but not the per-group
-detail the verification spec mandates.  
-**Gap:** Section-9 observability assertions (stable representations during
-bootstrap/elections/movement/failures, bounded cardinality, etc.) not
-implemented as automated tests.
+**State:** PASS  
+**Evidence:** PR #89 added per-group Raft fields to `TopologyView` (role, term,
+config, commit/apply index, snapshot progress, replica lag). PR #96 added the
+production metrics surface `src/placement_metrics.rs` on `PlacementNode`
+(workers/tasks, groups, per-replica Raft detail, RPC attempts/failures/
+backpressure/bytes, per-peer views, RSS + per-replica memory, redirects by
+cause, movement phase/duration/results/failures + aggregate byte flow, skew,
+bounded cardinality, paginated shard inspection). PR #97 added
+`node_timers` (HomeKV-owned timer count, asserted `== 2`).
+`tests/m4_observability_matrices.rs` (11 tests) asserts stable topology views,
+per-group field consistency, bounded cardinality, health transitions, and the
+production snapshot covering every §9 field.  
+**Honest scope:** only existing signals are reported — timers are the
+HomeKV-owned count (no stable tokio timer-wheel API); connections are the
+per-peer factory entries (in-process transport has no sockets); movement bytes
+are aggregate snapshot-transfer/per-peer payload bytes (per-operation
+attribution would violate bounded cardinality, REQ-M4-OPS-003); queue depth is
+reported where HomeKV owns the queue.
 
 ### REQ-M4-PERF-001..006 (Scaling benchmark)
 
