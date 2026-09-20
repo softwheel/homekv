@@ -10,24 +10,51 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot, SnapshotMeta};
-use openraft::{BasicNode, Entry, EntryPayload, LogId, OptionalSend, StorageError, StorageIOError, StoredMembership};
+use openraft::{
+    BasicNode, Entry, EntryPayload, LogId, OptionalSend, StorageError, StorageIOError,
+    StoredMembership,
+};
 use serde_derive::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 use tokio::sync::RwLock;
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::placement::{
+    CatalogCommand, CatalogResponse, PlacementCatalog, PlacementError, CATALOG_STATE_KEY,
+};
+
 pub type RaftNodeId = u64;
 pub type RaftNode = BasicNode;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub enum RaftMutation { Set { key: Vec<u8>, value: Vec<u8> }, Delete { key: Vec<u8> } }
+pub enum RaftMutation {
+    Set { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum RaftCommand {
-    Set { key: Vec<u8>, value: Vec<u8> },
-    Delete { key: Vec<u8> },
-    Batch { mutations: Vec<RaftMutation> },
-    Initialize { key: Vec<u8>, value: Vec<u8> },
+    Set {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Delete {
+        key: Vec<u8>,
+    },
+    Batch {
+        mutations: Vec<RaftMutation>,
+    },
+    Initialize {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    /// Atomically apply a placement catalog command against the reserved
+    /// catalog key. The command (including its expected epoch) is validated
+    /// inside the state machine in replicated log order, so concurrent
+    /// controllers get fail-closed rejections instead of lost updates.
+    CatalogMutation {
+        command: CatalogCommand,
+    },
 }
 
 impl fmt::Display for RaftCommand {
@@ -39,17 +66,33 @@ impl fmt::Display for RaftCommand {
             Self::Initialize { key, value } => {
                 write!(f, "initialize({},{})", key.len(), value.len())
             }
+            Self::CatalogMutation { command } => write!(f, "catalog-mutation({command:?})"),
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum RaftResponse {
-    Applied { mutations: u32 },
+    Applied {
+        mutations: u32,
+    },
     EmptyBatch,
     Noop,
     AlreadyPresent,
     Conflict,
+    /// A catalog mutation was applied; carries the catalog-level response.
+    CatalogApplied {
+        response: CatalogResponse,
+    },
+    /// The catalog key is absent and the command was not a bootstrap.
+    CatalogNotInitialized,
+    /// The catalog snapshot under the reserved key is corrupt.
+    CatalogCorrupt,
+    /// The catalog command was deterministically rejected; the log and the
+    /// snapshot are unchanged.
+    CatalogRejected {
+        error: PlacementError,
+    },
 }
 
 impl fmt::Display for RaftResponse {
@@ -60,6 +103,10 @@ impl fmt::Display for RaftResponse {
             Self::Noop => write!(f, "noop"),
             Self::AlreadyPresent => write!(f, "already-present"),
             Self::Conflict => write!(f, "conflict"),
+            Self::CatalogApplied { response } => write!(f, "catalog-applied({response:?})"),
+            Self::CatalogNotInitialized => write!(f, "catalog-not-initialized"),
+            Self::CatalogCorrupt => write!(f, "catalog-corrupt"),
+            Self::CatalogRejected { error } => write!(f, "catalog-rejected({error})"),
         }
     }
 }
@@ -74,16 +121,30 @@ pub struct HomeKvSnapshotData {
 
 impl HomeKvSnapshotData {
     fn receiving(max_bytes: usize, metrics: HomeKvStateMachineMetrics) -> Self {
-        Self { inner: Cursor::new(Vec::new()), max_bytes, receive_metrics: Some(metrics) }
+        Self {
+            inner: Cursor::new(Vec::new()),
+            max_bytes,
+            receive_metrics: Some(metrics),
+        }
     }
-    pub fn into_inner(self) -> Vec<u8> { self.inner.into_inner() }
-    pub fn len(&self) -> usize { self.inner.get_ref().len() }
-    pub fn is_empty(&self) -> bool { self.inner.get_ref().is_empty() }
+    pub fn into_inner(self) -> Vec<u8> {
+        self.inner.into_inner()
+    }
+    pub fn len(&self) -> usize {
+        self.inner.get_ref().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.inner.get_ref().is_empty()
+    }
 }
 
 impl From<Vec<u8>> for HomeKvSnapshotData {
     fn from(bytes: Vec<u8>) -> Self {
-        Self { max_bytes: bytes.len().max(1), inner: Cursor::new(bytes), receive_metrics: None }
+        Self {
+            max_bytes: bytes.len().max(1),
+            inner: Cursor::new(bytes),
+            receive_metrics: None,
+        }
     }
 }
 
@@ -94,22 +155,37 @@ impl io::Read for HomeKvSnapshotData {
 }
 
 impl AsyncRead for HomeKvSnapshotData {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for HomeKvSnapshotData {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let position = usize::try_from(this.inner.position()).unwrap_or(usize::MAX);
         if buf.len() > this.max_bytes.saturating_sub(position) {
-            if let Some(metrics) = &this.receive_metrics { metrics.record_snapshot_receive_rejection(); }
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "snapshot receive capacity exceeded")));
+            if let Some(metrics) = &this.receive_metrics {
+                metrics.record_snapshot_receive_rejection();
+            }
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot receive capacity exceeded",
+            )));
         }
         let result = Pin::new(&mut this.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(_)) = &result {
-            if let Some(metrics) = &this.receive_metrics { metrics.record_snapshot_receive_progress(this.inner.get_ref().len()); }
+            if let Some(metrics) = &this.receive_metrics {
+                metrics.record_snapshot_receive_progress(this.inner.get_ref().len());
+            }
         }
         result
     }
@@ -167,8 +243,7 @@ const SNAPSHOT_MAGIC: &[u8; 8] = b"HKVSNAP1";
 const SNAPSHOT_VERSION: u16 = 1;
 const M3_SHARD_ID: u64 = 0;
 const SNAPSHOT_HEADER_LEN: usize = 8 + 8 + 8;
-const APPLY_LATENCY_UPPER_BOUNDS_MICROS: [u64; 7] =
-    [10, 50, 100, 500, 1_000, 5_000, 25_000];
+const APPLY_LATENCY_UPPER_BOUNDS_MICROS: [u64; 7] = [10, 50, 100, 500, 1_000, 5_000, 25_000];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ApplyLatencyHistogramSnapshot {
@@ -234,9 +309,7 @@ impl ApplyLatencyHistogram {
     fn snapshot(&self) -> ApplyLatencyHistogramSnapshot {
         ApplyLatencyHistogramSnapshot {
             upper_bounds_micros: APPLY_LATENCY_UPPER_BOUNDS_MICROS,
-            bucket_counts: std::array::from_fn(|index| {
-                self.buckets[index].load(Ordering::Relaxed)
-            }),
+            bucket_counts: std::array::from_fn(|index| self.buckets[index].load(Ordering::Relaxed)),
             observations: self.observations.load(Ordering::Relaxed),
             total_micros: self.total_micros.load(Ordering::Relaxed),
             max_micros: self.max_micros.load(Ordering::Relaxed),
@@ -384,11 +457,15 @@ impl HomeKvStateMachineMetrics {
     }
 
     fn record_snapshot_receive_progress(&self, bytes: usize) {
-        self.inner.snapshot_receive_peak_bytes.fetch_max(bytes.min(u64::MAX as usize) as u64, Ordering::Relaxed);
+        self.inner
+            .snapshot_receive_peak_bytes
+            .fetch_max(bytes.min(u64::MAX as usize) as u64, Ordering::Relaxed);
     }
 
     fn record_snapshot_receive_rejection(&self) {
-        self.inner.snapshot_receive_rejections.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .snapshot_receive_rejections
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn snapshot_operations(&self, receive_capacity_bytes: usize) -> SnapshotMetricsSnapshot {
@@ -398,12 +475,21 @@ impl HomeKvStateMachineMetrics {
             build_failures: self.inner.snapshot_build_failures.load(Ordering::Relaxed),
             build_bytes: self.inner.snapshot_build_bytes.load(Ordering::Relaxed),
             install_attempts: self.inner.snapshot_install_attempts.load(Ordering::Relaxed),
-            installs_succeeded: self.inner.snapshot_installs_succeeded.load(Ordering::Relaxed),
+            installs_succeeded: self
+                .inner
+                .snapshot_installs_succeeded
+                .load(Ordering::Relaxed),
             install_failures: self.inner.snapshot_install_failures.load(Ordering::Relaxed),
             install_bytes: self.inner.snapshot_install_bytes.load(Ordering::Relaxed),
             receive_capacity_bytes,
-            receive_peak_bytes: self.inner.snapshot_receive_peak_bytes.load(Ordering::Relaxed),
-            receive_rejections: self.inner.snapshot_receive_rejections.load(Ordering::Relaxed),
+            receive_peak_bytes: self
+                .inner
+                .snapshot_receive_peak_bytes
+                .load(Ordering::Relaxed),
+            receive_rejections: self
+                .inner
+                .snapshot_receive_rejections
+                .load(Ordering::Relaxed),
             build_latency: self.inner.snapshot_build_latency.snapshot(),
             install_latency: self.inner.snapshot_install_latency.snapshot(),
         }
@@ -439,7 +525,9 @@ impl HomeKvStateMachine {
         snapshot_receive_limit_bytes: usize,
     ) -> Result<Self, StorageError<RaftNodeId>> {
         if snapshot_receive_limit_bytes == 0 {
-            return Err(Self::storage_error("snapshot receive limit must be above zero"));
+            return Err(Self::storage_error(
+                "snapshot receive limit must be above zero",
+            ));
         }
         let path = snapshot_path.as_ref().to_path_buf();
         let state = match fs::read(&path) {
@@ -466,17 +554,24 @@ impl HomeKvStateMachine {
 
     pub async fn view(&self) -> StateMachineView {
         let state = self.inner.read().await;
-        StateMachineView { last_applied: state.last_applied, membership: state.membership.clone(), data: state.data.clone() }
+        StateMachineView {
+            last_applied: state.last_applied,
+            membership: state.membership.clone(),
+            data: state.data.clone(),
+        }
     }
 
-    pub async fn get(&self, key: &[u8]) -> Option<Vec<u8>> { self.inner.read().await.data.get(key).cloned() }
+    pub async fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.inner.read().await.data.get(key).cloned()
+    }
 
     pub fn metrics(&self) -> StateMachineApplyMetricsSnapshot {
         self.metrics.snapshot()
     }
 
     pub fn snapshot_metrics(&self) -> SnapshotMetricsSnapshot {
-        self.metrics.snapshot_operations(self.snapshot_receive_limit_bytes)
+        self.metrics
+            .snapshot_operations(self.snapshot_receive_limit_bytes)
     }
 
     fn storage_error(message: &'static str) -> StorageError<RaftNodeId> {
@@ -500,7 +595,10 @@ impl HomeKvStateMachine {
         let Some(path) = self.snapshot_path.as_deref() else {
             return Ok(());
         };
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent)
                 .map_err(|_| Self::storage_error("snapshot directory creation failed"))?;
         }
@@ -518,7 +616,10 @@ impl HomeKvStateMachine {
         drop(file);
         fs::rename(&temporary, path)
             .map_err(|_| Self::storage_error("snapshot atomic replacement failed"))?;
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             File::open(parent)
                 .and_then(|directory| directory.sync_all())
                 .map_err(|_| Self::storage_error("snapshot directory sync failed"))?;
@@ -527,7 +628,8 @@ impl HomeKvStateMachine {
     }
 
     fn encode_snapshot(image: &SnapshotImage) -> Result<Vec<u8>, StorageError<RaftNodeId>> {
-        let payload = bincode::serialize(image).map_err(|_| Self::storage_error("snapshot encode failed"))?;
+        let payload =
+            bincode::serialize(image).map_err(|_| Self::storage_error("snapshot encode failed"))?;
         let mut bytes = Vec::with_capacity(SNAPSHOT_HEADER_LEN + payload.len());
         bytes.extend_from_slice(SNAPSHOT_MAGIC);
         bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
@@ -537,30 +639,53 @@ impl HomeKvStateMachine {
     }
 
     fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotImage, StorageError<RaftNodeId>> {
-        if bytes.len() < SNAPSHOT_HEADER_LEN || &bytes[..8] != SNAPSHOT_MAGIC { return Err(Self::storage_error("invalid snapshot envelope")); }
+        if bytes.len() < SNAPSHOT_HEADER_LEN || &bytes[..8] != SNAPSHOT_MAGIC {
+            return Err(Self::storage_error("invalid snapshot envelope"));
+        }
         let len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
         let checksum = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-        if bytes.len() != SNAPSHOT_HEADER_LEN + len { return Err(Self::storage_error("snapshot length mismatch")); }
+        if bytes.len() != SNAPSHOT_HEADER_LEN + len {
+            return Err(Self::storage_error("snapshot length mismatch"));
+        }
         let payload = &bytes[SNAPSHOT_HEADER_LEN..];
-        if xxh3_64(payload) != checksum { return Err(Self::storage_error("snapshot checksum mismatch")); }
-        let image: SnapshotImage = bincode::deserialize(payload).map_err(|_| Self::storage_error("snapshot decode failed"))?;
-        if image.format_version != SNAPSHOT_VERSION || image.shard_id != M3_SHARD_ID { return Err(Self::storage_error("snapshot version or shard mismatch")); }
+        if xxh3_64(payload) != checksum {
+            return Err(Self::storage_error("snapshot checksum mismatch"));
+        }
+        let image: SnapshotImage = bincode::deserialize(payload)
+            .map_err(|_| Self::storage_error("snapshot decode failed"))?;
+        if image.format_version != SNAPSHOT_VERSION || image.shard_id != M3_SHARD_ID {
+            return Err(Self::storage_error("snapshot version or shard mismatch"));
+        }
         Ok(image)
     }
 
     fn apply_command(state: &mut StateMachineData, command: RaftCommand) -> RaftResponse {
         match command {
-            RaftCommand::Set { key, value } => { state.data.insert(key, value); RaftResponse::Applied { mutations: 1 } }
-            RaftCommand::Delete { key } => { state.data.remove(&key); RaftResponse::Applied { mutations: 1 } }
+            RaftCommand::Set { key, value } => {
+                state.data.insert(key, value);
+                RaftResponse::Applied { mutations: 1 }
+            }
+            RaftCommand::Delete { key } => {
+                state.data.remove(&key);
+                RaftResponse::Applied { mutations: 1 }
+            }
             RaftCommand::Batch { mutations } => {
-                if mutations.is_empty() { return RaftResponse::EmptyBatch; }
+                if mutations.is_empty() {
+                    return RaftResponse::EmptyBatch;
+                }
                 for mutation in &mutations {
                     match mutation {
-                        RaftMutation::Set { key, value } => { state.data.insert(key.clone(), value.clone()); }
-                        RaftMutation::Delete { key } => { state.data.remove(key); }
+                        RaftMutation::Set { key, value } => {
+                            state.data.insert(key.clone(), value.clone());
+                        }
+                        RaftMutation::Delete { key } => {
+                            state.data.remove(key);
+                        }
                     }
                 }
-                RaftResponse::Applied { mutations: mutations.len() as u32 }
+                RaftResponse::Applied {
+                    mutations: mutations.len() as u32,
+                }
             }
             RaftCommand::Initialize { key, value } => match state.data.get(&key) {
                 None => {
@@ -570,15 +695,61 @@ impl HomeKvStateMachine {
                 Some(current) if current == &value => RaftResponse::AlreadyPresent,
                 Some(_) => RaftResponse::Conflict,
             },
+            RaftCommand::CatalogMutation { command } => {
+                Self::apply_catalog_mutation(state, command)
+            }
+        }
+    }
+
+    /// Apply a placement catalog command atomically inside the state machine.
+    ///
+    /// The catalog is loaded from the reserved key, the command is validated
+    /// against the committed image (including its expected epoch), and the
+    /// resulting snapshot is stored back — all as one deterministic state
+    /// machine transition. Concurrent controllers racing on the same epoch
+    /// get a `CatalogRejected(StaleCatalogView)` instead of silently
+    /// overwriting each other (REQ-M4-MOVE-004). Bootstrap is the only
+    /// command that may create the catalog; anything else fails closed when
+    /// the key is absent or the snapshot is corrupt.
+    fn apply_catalog_mutation(
+        state: &mut StateMachineData,
+        command: CatalogCommand,
+    ) -> RaftResponse {
+        let mut catalog = match state.data.get(CATALOG_STATE_KEY) {
+            None => {
+                if !matches!(command, CatalogCommand::Bootstrap { .. }) {
+                    return RaftResponse::CatalogNotInitialized;
+                }
+                PlacementCatalog::default()
+            }
+            Some(bytes) => match PlacementCatalog::restore_snapshot(bytes) {
+                Ok(catalog) => catalog,
+                Err(_) => return RaftResponse::CatalogCorrupt,
+            },
+        };
+        let response = match catalog.apply(command) {
+            Ok(response) => response,
+            Err(error) => return RaftResponse::CatalogRejected { error },
+        };
+        match catalog.encode_snapshot() {
+            Ok(bytes) => {
+                state.data.insert(CATALOG_STATE_KEY.to_vec(), bytes);
+                RaftResponse::CatalogApplied { response }
+            }
+            Err(_) => RaftResponse::CatalogCorrupt,
         }
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct HomeKvSnapshotBuilder { state_machine: HomeKvStateMachine }
+pub struct HomeKvSnapshotBuilder {
+    state_machine: HomeKvStateMachine,
+}
 
 impl RaftSnapshotBuilder<HomeKvRaftConfig> for HomeKvSnapshotBuilder {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<HomeKvRaftConfig>, StorageError<RaftNodeId>> {
+    async fn build_snapshot(
+        &mut self,
+    ) -> Result<Snapshot<HomeKvRaftConfig>, StorageError<RaftNodeId>> {
         let started = Instant::now();
         let result: Result<Snapshot<HomeKvRaftConfig>, StorageError<RaftNodeId>> = async {
             let mut state = self.state_machine.inner.write().await;
@@ -593,18 +764,19 @@ impl RaftSnapshotBuilder<HomeKvRaftConfig> for HomeKvSnapshotBuilder {
             let bytes = HomeKvStateMachine::encode_snapshot(&image)?;
             self.state_machine.persist_snapshot(&bytes)?;
             state.current_snapshot = Some((meta.clone(), bytes.clone()));
-            Ok(Snapshot { meta, snapshot: Box::new(HomeKvSnapshotData::from(bytes)) })
+            Ok(Snapshot {
+                meta,
+                snapshot: Box::new(HomeKvSnapshotData::from(bytes)),
+            })
         }
         .await;
         let bytes = result
             .as_ref()
             .map(|snapshot| snapshot.snapshot.len() as u64)
             .unwrap_or(0);
-        self.state_machine.metrics.record_snapshot_build(
-            started.elapsed(),
-            bytes,
-            result.is_err(),
-        );
+        self.state_machine
+            .metrics
+            .record_snapshot_build(started.elapsed(), bytes, result.is_err());
         result
     }
 }
@@ -612,13 +784,24 @@ impl RaftSnapshotBuilder<HomeKvRaftConfig> for HomeKvSnapshotBuilder {
 impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
     type SnapshotBuilder = HomeKvSnapshotBuilder;
 
-    async fn applied_state(&mut self) -> Result<(Option<LogId<RaftNodeId>>, StoredMembership<RaftNodeId, RaftNode>), StorageError<RaftNodeId>> {
+    async fn applied_state(
+        &mut self,
+    ) -> Result<
+        (
+            Option<LogId<RaftNodeId>>,
+            StoredMembership<RaftNodeId, RaftNode>,
+        ),
+        StorageError<RaftNodeId>,
+    > {
         let state = self.inner.read().await;
         Ok((state.last_applied, state.membership.clone()))
     }
 
     async fn apply<I>(&mut self, entries: I) -> Result<Vec<RaftResponse>, StorageError<RaftNodeId>>
-    where I: IntoIterator<Item = Entry<HomeKvRaftConfig>> + OptionalSend, I::IntoIter: OptionalSend {
+    where
+        I: IntoIterator<Item = Entry<HomeKvRaftConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
         let started = Instant::now();
         let mut observation = ApplyObservation::default();
         let result = async {
@@ -647,8 +830,7 @@ impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
                     }
                     EntryPayload::Membership(membership) => {
                         observation.membership_entries += 1;
-                        state.membership =
-                            StoredMembership::new(Some(entry.log_id), membership);
+                        state.membership = StoredMembership::new(Some(entry.log_id), membership);
                         RaftResponse::Noop
                     }
                 };
@@ -667,22 +849,37 @@ impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
         result
     }
 
-    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder { HomeKvSnapshotBuilder { state_machine: self.clone() } }
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        HomeKvSnapshotBuilder {
+            state_machine: self.clone(),
+        }
+    }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<<HomeKvRaftConfig as openraft::RaftTypeConfig>::SnapshotData>, StorageError<RaftNodeId>> {
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<
+        Box<<HomeKvRaftConfig as openraft::RaftTypeConfig>::SnapshotData>,
+        StorageError<RaftNodeId>,
+    > {
         Ok(Box::new(HomeKvSnapshotData::receiving(
             self.snapshot_receive_limit_bytes,
             self.metrics.clone(),
         )))
     }
 
-    async fn install_snapshot(&mut self, meta: &SnapshotMeta<RaftNodeId, RaftNode>, snapshot: Box<<HomeKvRaftConfig as openraft::RaftTypeConfig>::SnapshotData>) -> Result<(), StorageError<RaftNodeId>> {
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<RaftNodeId, RaftNode>,
+        snapshot: Box<<HomeKvRaftConfig as openraft::RaftTypeConfig>::SnapshotData>,
+    ) -> Result<(), StorageError<RaftNodeId>> {
         let started = Instant::now();
         let bytes = snapshot.into_inner();
         let byte_count = bytes.len() as u64;
         let result = async {
             let image = Self::decode_snapshot(&bytes)?;
-            if image.last_applied != meta.last_log_id || image.membership != meta.last_membership { return Err(Self::storage_error("snapshot metadata mismatch")); }
+            if image.last_applied != meta.last_log_id || image.membership != meta.last_membership {
+                return Err(Self::storage_error("snapshot metadata mismatch"));
+            }
             let mut state = self.inner.write().await;
             self.persist_snapshot(&bytes)?;
             state.last_applied = image.last_applied;
@@ -700,55 +897,173 @@ impl RaftStateMachine<HomeKvRaftConfig> for HomeKvStateMachine {
         result
     }
 
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<HomeKvRaftConfig>>, StorageError<RaftNodeId>> {
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<Snapshot<HomeKvRaftConfig>>, StorageError<RaftNodeId>> {
         let state = self.inner.read().await;
-        Ok(state.current_snapshot.as_ref().map(|(meta, bytes)| Snapshot { meta: meta.clone(), snapshot: Box::new(HomeKvSnapshotData::from(bytes.clone())) }))
+        Ok(state
+            .current_snapshot
+            .as_ref()
+            .map(|(meta, bytes)| Snapshot {
+                meta: meta.clone(),
+                snapshot: Box::new(HomeKvSnapshotData::from(bytes.clone())),
+            }))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use openraft::{CommittedLeaderId, Membership};
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Read;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use openraft::{CommittedLeaderId, Membership};
-    use super::*;
 
-    fn log_id(index: u64) -> LogId<RaftNodeId> { LogId::new(CommittedLeaderId::new(1, 1), index) }
-    fn normal(index: u64, command: RaftCommand) -> Entry<HomeKvRaftConfig> { Entry { log_id: log_id(index), payload: EntryPayload::Normal(command) } }
+    fn log_id(index: u64) -> LogId<RaftNodeId> {
+        LogId::new(CommittedLeaderId::new(1, 1), index)
+    }
+    fn normal(index: u64, command: RaftCommand) -> Entry<HomeKvRaftConfig> {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(command),
+        }
+    }
 
     fn snapshot_path(name: &str) -> PathBuf {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("homekv-{name}-{}-{nonce}.snapshot", std::process::id()))
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "homekv-{name}-{}-{nonce}.snapshot",
+            std::process::id()
+        ))
     }
 
     #[tokio::test]
     async fn applies_commands_in_committed_order() {
         let mut sm = HomeKvStateMachine::default();
-        let responses = sm.apply(vec![normal(1, RaftCommand::Set { key: b"a".to_vec(), value: b"one".to_vec() }), normal(2, RaftCommand::Batch { mutations: vec![RaftMutation::Set { key: b"b".to_vec(), value: b"two".to_vec() }, RaftMutation::Delete { key: b"a".to_vec() }]}), normal(3, RaftCommand::Delete { key: b"missing".to_vec() })]).await.unwrap();
-        assert_eq!(responses, vec![RaftResponse::Applied { mutations: 1 }, RaftResponse::Applied { mutations: 2 }, RaftResponse::Applied { mutations: 1 }]);
-        assert_eq!(sm.get(b"a").await, None); assert_eq!(sm.get(b"b").await, Some(b"two".to_vec())); assert_eq!(sm.view().await.last_applied, Some(log_id(3)));
+        let responses = sm
+            .apply(vec![
+                normal(
+                    1,
+                    RaftCommand::Set {
+                        key: b"a".to_vec(),
+                        value: b"one".to_vec(),
+                    },
+                ),
+                normal(
+                    2,
+                    RaftCommand::Batch {
+                        mutations: vec![
+                            RaftMutation::Set {
+                                key: b"b".to_vec(),
+                                value: b"two".to_vec(),
+                            },
+                            RaftMutation::Delete { key: b"a".to_vec() },
+                        ],
+                    },
+                ),
+                normal(
+                    3,
+                    RaftCommand::Delete {
+                        key: b"missing".to_vec(),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            responses,
+            vec![
+                RaftResponse::Applied { mutations: 1 },
+                RaftResponse::Applied { mutations: 2 },
+                RaftResponse::Applied { mutations: 1 }
+            ]
+        );
+        assert_eq!(sm.get(b"a").await, None);
+        assert_eq!(sm.get(b"b").await, Some(b"two".to_vec()));
+        assert_eq!(sm.view().await.last_applied, Some(log_id(3)));
     }
 
     #[tokio::test]
     async fn membership_entry_updates_metadata_only() {
-        let mut sm = HomeKvStateMachine::default(); sm.apply(vec![normal(1, RaftCommand::Set { key: b"k".to_vec(), value: b"v".to_vec() })]).await.unwrap(); let before = sm.view().await.data;
-        let voters = BTreeSet::from([1, 2, 3]); let membership = Membership::new(vec![voters], BTreeMap::<RaftNodeId, RaftNode>::new());
-        sm.apply(vec![Entry { log_id: log_id(2), payload: EntryPayload::Membership(membership) }]).await.unwrap();
-        let view = sm.view().await; assert_eq!(view.data, before); assert_eq!(view.last_applied, Some(log_id(2))); assert_eq!(view.membership.log_id(), &Some(log_id(2)));
+        let mut sm = HomeKvStateMachine::default();
+        sm.apply(vec![normal(
+            1,
+            RaftCommand::Set {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            },
+        )])
+        .await
+        .unwrap();
+        let before = sm.view().await.data;
+        let voters = BTreeSet::from([1, 2, 3]);
+        let membership = Membership::new(vec![voters], BTreeMap::<RaftNodeId, RaftNode>::new());
+        sm.apply(vec![Entry {
+            log_id: log_id(2),
+            payload: EntryPayload::Membership(membership),
+        }])
+        .await
+        .unwrap();
+        let view = sm.view().await;
+        assert_eq!(view.data, before);
+        assert_eq!(view.last_applied, Some(log_id(2)));
+        assert_eq!(view.membership.log_id(), &Some(log_id(2)));
     }
 
     #[tokio::test]
     async fn replay_is_deterministic_and_duplicate_identity_is_not_reapplied() {
-        let history = || vec![normal(1, RaftCommand::Set { key: b"k".to_vec(), value: b"v1".to_vec() }), normal(2, RaftCommand::Set { key: b"k".to_vec(), value: b"v2".to_vec() })];
-        let mut first = HomeKvStateMachine::default(); let mut recovered = HomeKvStateMachine::default(); first.apply(history()).await.unwrap(); recovered.apply(history()).await.unwrap(); assert_eq!(first.view().await, recovered.view().await);
-        let duplicate = normal(2, RaftCommand::Delete { key: b"k".to_vec() }); assert_eq!(first.apply(vec![duplicate]).await.unwrap(), vec![RaftResponse::Noop]); assert_eq!(first.get(b"k").await, Some(b"v2".to_vec()));
+        let history = || {
+            vec![
+                normal(
+                    1,
+                    RaftCommand::Set {
+                        key: b"k".to_vec(),
+                        value: b"v1".to_vec(),
+                    },
+                ),
+                normal(
+                    2,
+                    RaftCommand::Set {
+                        key: b"k".to_vec(),
+                        value: b"v2".to_vec(),
+                    },
+                ),
+            ]
+        };
+        let mut first = HomeKvStateMachine::default();
+        let mut recovered = HomeKvStateMachine::default();
+        first.apply(history()).await.unwrap();
+        recovered.apply(history()).await.unwrap();
+        assert_eq!(first.view().await, recovered.view().await);
+        let duplicate = normal(2, RaftCommand::Delete { key: b"k".to_vec() });
+        assert_eq!(
+            first.apply(vec![duplicate]).await.unwrap(),
+            vec![RaftResponse::Noop]
+        );
+        assert_eq!(first.get(b"k").await, Some(b"v2".to_vec()));
     }
 
     #[tokio::test]
     async fn lower_log_index_fails_closed() {
-        let mut sm = HomeKvStateMachine::default(); sm.apply(vec![normal(2, RaftCommand::Set { key: b"k".to_vec(), value: b"v".to_vec() })]).await.unwrap(); let before = sm.view().await;
-        assert!(sm.apply(vec![normal(1, RaftCommand::Delete { key: b"k".to_vec() })]).await.is_err()); assert_eq!(sm.view().await, before);
+        let mut sm = HomeKvStateMachine::default();
+        sm.apply(vec![normal(
+            2,
+            RaftCommand::Set {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            },
+        )])
+        .await
+        .unwrap();
+        let before = sm.view().await;
+        assert!(sm
+            .apply(vec![normal(1, RaftCommand::Delete { key: b"k".to_vec() })])
+            .await
+            .is_err());
+        assert_eq!(sm.view().await, before);
     }
 
     #[tokio::test]
@@ -796,9 +1111,32 @@ mod tests {
     #[tokio::test]
     async fn snapshot_round_trip_preserves_state_and_metadata() {
         let mut source = HomeKvStateMachine::default();
-        source.apply(vec![normal(1, RaftCommand::Set { key: b"a".to_vec(), value: b"one".to_vec() }), normal(2, RaftCommand::Set { key: b"b".to_vec(), value: b"two".to_vec() })]).await.unwrap();
-        let mut builder = source.get_snapshot_builder().await; let snapshot = builder.build_snapshot().await.unwrap();
-        let mut restored = HomeKvStateMachine::default(); restored.install_snapshot(&snapshot.meta, snapshot.snapshot).await.unwrap();
+        source
+            .apply(vec![
+                normal(
+                    1,
+                    RaftCommand::Set {
+                        key: b"a".to_vec(),
+                        value: b"one".to_vec(),
+                    },
+                ),
+                normal(
+                    2,
+                    RaftCommand::Set {
+                        key: b"b".to_vec(),
+                        value: b"two".to_vec(),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        let mut builder = source.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = HomeKvStateMachine::default();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
         assert_eq!(restored.view().await, source.view().await);
         assert!(restored.get_current_snapshot().await.unwrap().is_some());
     }
@@ -807,26 +1145,58 @@ mod tests {
     async fn durable_snapshot_reopens_and_accepts_subsequent_log_replay() {
         let path = snapshot_path("reopen");
         let mut source = HomeKvStateMachine::open(&path).unwrap();
-        source.apply(vec![
-            normal(1, RaftCommand::Set { key: b"a".to_vec(), value: b"one".to_vec() }),
-            normal(2, RaftCommand::Set { key: b"b".to_vec(), value: b"two".to_vec() }),
-        ]).await.unwrap();
-        source.get_snapshot_builder().await.build_snapshot().await.unwrap();
+        source
+            .apply(vec![
+                normal(
+                    1,
+                    RaftCommand::Set {
+                        key: b"a".to_vec(),
+                        value: b"one".to_vec(),
+                    },
+                ),
+                normal(
+                    2,
+                    RaftCommand::Set {
+                        key: b"b".to_vec(),
+                        value: b"two".to_vec(),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
         drop(source);
 
         let mut recovered = HomeKvStateMachine::open(&path).unwrap();
         assert_eq!(recovered.get(b"a").await, Some(b"one".to_vec()));
         assert_eq!(recovered.view().await.last_applied, Some(log_id(2)));
-        recovered.apply(vec![
-            normal(3, RaftCommand::Delete { key: b"a".to_vec() }),
-            normal(4, RaftCommand::Set { key: b"c".to_vec(), value: b"three".to_vec() }),
-        ]).await.unwrap();
+        recovered
+            .apply(vec![
+                normal(3, RaftCommand::Delete { key: b"a".to_vec() }),
+                normal(
+                    4,
+                    RaftCommand::Set {
+                        key: b"c".to_vec(),
+                        value: b"three".to_vec(),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
         let view = recovered.view().await;
         assert_eq!(view.last_applied, Some(log_id(4)));
-        assert_eq!(view.data, BTreeMap::from([
-            (b"b".to_vec(), b"two".to_vec()),
-            (b"c".to_vec(), b"three".to_vec()),
-        ]));
+        assert_eq!(
+            view.data,
+            BTreeMap::from([
+                (b"b".to_vec(), b"two".to_vec()),
+                (b"c".to_vec(), b"three".to_vec()),
+            ])
+        );
         assert!(recovered.get_current_snapshot().await.unwrap().is_some());
         fs::remove_file(path).unwrap();
     }
@@ -835,8 +1205,22 @@ mod tests {
     async fn interrupted_temporary_snapshot_never_replaces_last_durable_image() {
         let path = snapshot_path("interrupted");
         let mut source = HomeKvStateMachine::open(&path).unwrap();
-        source.apply(vec![normal(1, RaftCommand::Set { key: b"k".to_vec(), value: b"safe".to_vec() })]).await.unwrap();
-        source.get_snapshot_builder().await.build_snapshot().await.unwrap();
+        source
+            .apply(vec![normal(
+                1,
+                RaftCommand::Set {
+                    key: b"k".to_vec(),
+                    value: b"safe".to_vec(),
+                },
+            )])
+            .await
+            .unwrap();
+        source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
         fs::write(path.with_extension("tmp"), b"incomplete").unwrap();
         drop(source);
 
@@ -851,8 +1235,22 @@ mod tests {
     async fn corrupt_durable_snapshot_fails_closed_on_reopen() {
         let path = snapshot_path("corrupt");
         let mut source = HomeKvStateMachine::open(&path).unwrap();
-        source.apply(vec![normal(1, RaftCommand::Set { key: b"k".to_vec(), value: b"safe".to_vec() })]).await.unwrap();
-        source.get_snapshot_builder().await.build_snapshot().await.unwrap();
+        source
+            .apply(vec![normal(
+                1,
+                RaftCommand::Set {
+                    key: b"k".to_vec(),
+                    value: b"safe".to_vec(),
+                },
+            )])
+            .await
+            .unwrap();
+        source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
         drop(source);
 
         let mut bytes = fs::read(&path).unwrap();
@@ -865,19 +1263,69 @@ mod tests {
 
     #[tokio::test]
     async fn corrupted_snapshot_is_rejected_without_mutating_state() {
-        let mut source = HomeKvStateMachine::default(); source.apply(vec![normal(1, RaftCommand::Set { key: b"a".to_vec(), value: b"one".to_vec() })]).await.unwrap();
-        let mut builder = source.get_snapshot_builder().await; let snapshot = builder.build_snapshot().await.unwrap(); let meta = snapshot.meta;
-        let mut cursor = snapshot.snapshot; let mut bytes = Vec::new(); cursor.read_to_end(&mut bytes).unwrap(); let last = bytes.len() - 1; bytes[last] ^= 0xff;
-        let mut target = HomeKvStateMachine::default(); target.apply(vec![normal(1, RaftCommand::Set { key: b"existing".to_vec(), value: b"safe".to_vec() })]).await.unwrap(); let before = target.view().await;
-        assert!(target.install_snapshot(&meta, Box::new(HomeKvSnapshotData::from(bytes))).await.is_err()); assert_eq!(target.view().await, before);
+        let mut source = HomeKvStateMachine::default();
+        source
+            .apply(vec![normal(
+                1,
+                RaftCommand::Set {
+                    key: b"a".to_vec(),
+                    value: b"one".to_vec(),
+                },
+            )])
+            .await
+            .unwrap();
+        let mut builder = source.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let meta = snapshot.meta;
+        let mut cursor = snapshot.snapshot;
+        let mut bytes = Vec::new();
+        cursor.read_to_end(&mut bytes).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        let mut target = HomeKvStateMachine::default();
+        target
+            .apply(vec![normal(
+                1,
+                RaftCommand::Set {
+                    key: b"existing".to_vec(),
+                    value: b"safe".to_vec(),
+                },
+            )])
+            .await
+            .unwrap();
+        let before = target.view().await;
+        assert!(target
+            .install_snapshot(&meta, Box::new(HomeKvSnapshotData::from(bytes)))
+            .await
+            .is_err());
+        assert_eq!(target.view().await, before);
     }
 
     #[tokio::test]
     async fn truncated_snapshot_is_rejected() {
-        let mut source = HomeKvStateMachine::default(); source.apply(vec![normal(1, RaftCommand::Set { key: b"a".to_vec(), value: b"one".to_vec() })]).await.unwrap();
-        let mut builder = source.get_snapshot_builder().await; let snapshot = builder.build_snapshot().await.unwrap(); let meta = snapshot.meta;
-        let mut cursor = snapshot.snapshot; let mut bytes = Vec::new(); cursor.read_to_end(&mut bytes).unwrap(); bytes.truncate(bytes.len() - 3);
-        let mut target = HomeKvStateMachine::default(); assert!(target.install_snapshot(&meta, Box::new(HomeKvSnapshotData::from(bytes))).await.is_err());
+        let mut source = HomeKvStateMachine::default();
+        source
+            .apply(vec![normal(
+                1,
+                RaftCommand::Set {
+                    key: b"a".to_vec(),
+                    value: b"one".to_vec(),
+                },
+            )])
+            .await
+            .unwrap();
+        let mut builder = source.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let meta = snapshot.meta;
+        let mut cursor = snapshot.snapshot;
+        let mut bytes = Vec::new();
+        cursor.read_to_end(&mut bytes).unwrap();
+        bytes.truncate(bytes.len() - 3);
+        let mut target = HomeKvStateMachine::default();
+        assert!(target
+            .install_snapshot(&meta, Box::new(HomeKvSnapshotData::from(bytes)))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -920,19 +1368,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            sm.apply(vec![normal(
-                4,
-                RaftCommand::Delete { key: b"b".to_vec() },
-            )])
-            .await
-            .unwrap(),
+            sm.apply(vec![normal(4, RaftCommand::Delete { key: b"b".to_vec() },)])
+                .await
+                .unwrap(),
             vec![RaftResponse::Noop]
         );
         assert!(sm
-            .apply(vec![normal(
-                3,
-                RaftCommand::Delete { key: b"b".to_vec() },
-            )])
+            .apply(vec![normal(3, RaftCommand::Delete { key: b"b".to_vec() },)])
             .await
             .is_err());
 
@@ -1040,6 +1482,265 @@ mod tests {
         assert_eq!(failure_metrics.build_latency.observations, 1);
         fs::remove_file(blocker).unwrap();
     }
+}
 
+#[cfg(test)]
+mod catalog_mutation_tests {
+    use super::*;
+    use crate::placement::{EligibleNode, MovementPhase};
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
+    fn normal(index: u64, command: RaftCommand) -> Entry<HomeKvRaftConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Normal(command),
+        }
+    }
+
+    fn catalog_nodes() -> Vec<EligibleNode> {
+        ["a", "b", "c", "d"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, domain)| EligibleNode {
+                node_id: (index + 1) as u64,
+                raft_endpoint: format!("127.0.0.1:{}", 19_000 + index),
+                failure_domain: domain.to_string(),
+            })
+            .collect()
+    }
+
+    fn bootstrap_command(cluster_id: [u8; 16]) -> RaftCommand {
+        RaftCommand::CatalogMutation {
+            command: CatalogCommand::Bootstrap {
+                cluster_id,
+                eligible_nodes: catalog_nodes(),
+            },
+        }
+    }
+
+    async fn committed_catalog(sm: &HomeKvStateMachine) -> PlacementCatalog {
+        let bytes = sm
+            .get(CATALOG_STATE_KEY)
+            .await
+            .expect("catalog key must be present");
+        PlacementCatalog::restore_snapshot(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn catalog_mutation_fails_closed_without_bootstrap() {
+        let mut sm = HomeKvStateMachine::default();
+        let responses = sm
+            .apply(vec![normal(
+                1,
+                RaftCommand::CatalogMutation {
+                    command: CatalogCommand::AdvanceMovementPhase {
+                        expected_epoch: 1,
+                        operation_id: [1; 16],
+                        shard_id: 0,
+                        phase: MovementPhase::Learner,
+                    },
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(responses, vec![RaftResponse::CatalogNotInitialized]);
+        // Nothing was written: the key is still absent.
+        assert!(sm.get(CATALOG_STATE_KEY).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn catalog_mutation_bootstrap_is_atomic_and_idempotent() {
+        let mut sm = HomeKvStateMachine::default();
+        let cluster_id = *b"homekv-m4-test01";
+
+        let responses = sm
+            .apply(vec![normal(1, bootstrap_command(cluster_id))])
+            .await
+            .unwrap();
+        assert_eq!(
+            responses,
+            vec![RaftResponse::CatalogApplied {
+                response: CatalogResponse::Initialized { placement_epoch: 1 },
+            }]
+        );
+
+        // Replaying the identical bootstrap is idempotent, not a conflict.
+        let responses = sm
+            .apply(vec![normal(2, bootstrap_command(cluster_id))])
+            .await
+            .unwrap();
+        assert_eq!(
+            responses,
+            vec![RaftResponse::CatalogApplied {
+                response: CatalogResponse::AlreadyInitialized { placement_epoch: 1 },
+            }]
+        );
+
+        // A different cluster identity is a fail-closed conflict: the
+        // committed catalog keeps the original cluster id.
+        let responses = sm
+            .apply(vec![normal(3, bootstrap_command(*b"homekv-m4-other!"))])
+            .await
+            .unwrap();
+        assert_eq!(
+            responses,
+            vec![RaftResponse::CatalogRejected {
+                error: PlacementError::AlreadyInitializedWithDifferentConfiguration,
+            }]
+        );
+        let catalog = committed_catalog(&sm).await;
+        assert_eq!(catalog.state().unwrap().cluster_id, cluster_id);
+    }
+
+    #[tokio::test]
+    async fn catalog_mutation_serializes_concurrent_writers_in_log_order() {
+        let mut sm = HomeKvStateMachine::default();
+        sm.apply(vec![normal(1, bootstrap_command(*b"homekv-m4-test01"))])
+            .await
+            .unwrap();
+
+        // Build a valid movement target from the committed stable placement.
+        let catalog = committed_catalog(&sm).await;
+        let state = catalog.state().unwrap();
+        let stable = state.placements.get(&0).unwrap().voters;
+        let replacement = *state
+            .eligible_nodes
+            .keys()
+            .find(|id| !stable.contains(id))
+            .expect("four eligible nodes and three voters leave a spare");
+        let mut target = stable;
+        target[2] = replacement;
+        target.sort_unstable();
+
+        let begin = |operation: u8| RaftCommand::CatalogMutation {
+            command: CatalogCommand::BeginMovement {
+                expected_epoch: 1,
+                operation_id: [operation; 16],
+                shard_id: 0,
+                target_voters: target,
+            },
+        };
+
+        // Two controllers race with the same expected epoch. Log order
+        // decides: the first commits its intent, the second observes it and
+        // is rejected instead of silently overwriting it (REQ-M4-MOVE-004).
+        let responses = sm
+            .apply(vec![normal(2, begin(1)), normal(3, begin(2))])
+            .await
+            .unwrap();
+        assert_eq!(
+            responses,
+            vec![
+                RaftResponse::CatalogApplied {
+                    response: CatalogResponse::MovementAccepted {
+                        phase: MovementPhase::Intent,
+                    },
+                },
+                RaftResponse::CatalogRejected {
+                    error: PlacementError::ConflictingMovement { shard_id: 0 },
+                },
+            ]
+        );
+        let catalog = committed_catalog(&sm).await;
+        let pending = catalog
+            .state()
+            .unwrap()
+            .placements
+            .get(&0)
+            .unwrap()
+            .pending_movement
+            .clone()
+            .expect("first writer's intent must survive");
+        assert_eq!(pending.operation_id, [1; 16]);
+        assert_eq!(pending.target_voters, target);
+
+        // A stale expected epoch is rejected atomically inside the state
+        // machine, even though the phase transition itself is well-formed.
+        let responses = sm
+            .apply(vec![normal(
+                4,
+                RaftCommand::CatalogMutation {
+                    command: CatalogCommand::AdvanceMovementPhase {
+                        expected_epoch: 999,
+                        operation_id: [1; 16],
+                        shard_id: 0,
+                        phase: MovementPhase::Learner,
+                    },
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(
+            responses,
+            vec![RaftResponse::CatalogRejected {
+                error: PlacementError::StaleCatalogView {
+                    expected: 999,
+                    actual: 1,
+                },
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_mutation_fails_closed_on_corrupt_snapshot() {
+        let mut sm = HomeKvStateMachine::default();
+        sm.apply(vec![normal(1, bootstrap_command(*b"homekv-m4-test01"))])
+            .await
+            .unwrap();
+        // Corrupt the catalog key outside the catalog path.
+        sm.apply(vec![normal(
+            2,
+            RaftCommand::Set {
+                key: CATALOG_STATE_KEY.to_vec(),
+                value: b"not-a-catalog".to_vec(),
+            },
+        )])
+        .await
+        .unwrap();
+
+        let responses = sm
+            .apply(vec![normal(
+                3,
+                RaftCommand::CatalogMutation {
+                    command: CatalogCommand::AdvanceMovementPhase {
+                        expected_epoch: 1,
+                        operation_id: [1; 16],
+                        shard_id: 0,
+                        phase: MovementPhase::Learner,
+                    },
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(responses, vec![RaftResponse::CatalogCorrupt]);
+    }
+
+    #[test]
+    fn catalog_mutation_commands_survive_a_serde_round_trip() {
+        let command = RaftCommand::CatalogMutation {
+            command: CatalogCommand::BeginMovement {
+                expected_epoch: 7,
+                operation_id: [9; 16],
+                shard_id: 3,
+                target_voters: [1, 2, 4],
+            },
+        };
+        let bytes = bincode::serialize(&command).unwrap();
+        assert_eq!(
+            bincode::deserialize::<RaftCommand>(&bytes).unwrap(),
+            command
+        );
+
+        let response = RaftResponse::CatalogRejected {
+            error: PlacementError::StaleCatalogView {
+                expected: 7,
+                actual: 9,
+            },
+        };
+        let bytes = bincode::serialize(&response).unwrap();
+        assert_eq!(
+            bincode::deserialize::<RaftResponse>(&bytes).unwrap(),
+            response
+        );
+    }
 }
