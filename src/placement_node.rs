@@ -30,7 +30,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use openraft::{Config, ServerState};
@@ -194,10 +194,15 @@ impl PlacementNodeConfig {
 }
 
 /// One hosted replica: the Raft handle plus its state machine.
+///
+/// The log store handle is retained so observability tooling (and tests)
+/// can observe live durable replica state; it shares the same underlying
+/// store as the Raft instance.
 #[derive(Clone)]
 struct Replica {
     raft: Raft<HomeKvRaftConfig>,
     state_machine: Arc<HomeKvStateMachine>,
+    log_store: HomeKvRaftLogStore,
 }
 
 /// Start all replicas for one Raft group (catalog or data group).
@@ -239,7 +244,7 @@ async fn start_replicas(
             *id,
             raft_config.clone(),
             factories[id].clone(),
-            store,
+            store.clone(),
             (*state_machine).clone(),
         )
         .await
@@ -249,6 +254,7 @@ async fn start_replicas(
             Replica {
                 raft,
                 state_machine,
+                log_store: store,
             },
         );
     }
@@ -260,6 +266,29 @@ async fn start_replicas(
         }
     }
     Ok(replicas)
+}
+
+/// Wait, bounded by `timeout`, for the freshly initialized catalog primary
+/// to become leader. A genuinely leaderless catalog still fails closed with
+/// the same `ConsensusUnavailable` the bootstrap write would have produced.
+async fn wait_for_catalog_leadership(
+    raft: &Raft<HomeKvRaftConfig>,
+    timeout: Duration,
+) -> Result<(), PlacementNodeError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // `ensure_linearizable` succeeds only on the leader; it is the
+        // non-deprecated leadership check in openraft 0.9.
+        if raft.ensure_linearizable().await.is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(PlacementNodeError::Catalog(
+                "placement catalog consensus is unavailable".to_string(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Initialize a Raft cluster once; a restart that finds existing state is not
@@ -401,6 +430,17 @@ impl PlacementNode {
             &catalog_replicas[&config.catalog_voters[0]].raft,
             catalog_membership,
             "catalog",
+        )
+        .await?;
+        // `initialize()` returns once the membership change is accepted, not
+        // once this node has won the election. The bootstrap write below must
+        // land on the leader (any error, including `ForwardToLeader`, maps to
+        // `ConsensusUnavailable`), so wait — bounded — for leadership first.
+        // Without this, node startup fails spuriously on a loaded machine when
+        // the write races the election.
+        wait_for_catalog_leadership(
+            &catalog_replicas[&config.catalog_voters[0]].raft,
+            Duration::from_secs(15),
         )
         .await?;
         let catalog_primary = &catalog_replicas[&config.catalog_voters[0]];
@@ -623,6 +663,21 @@ impl PlacementNode {
             .get(&shard_id)
             .and_then(|replicas| replicas.get(&node_id))
             .map(|replica| replica.raft.clone())
+    }
+
+    /// The log store handle of a hosted replica (observability and tests).
+    ///
+    /// Shares the same underlying store as the replica's Raft instance, so
+    /// a replica observer built from it sees live durable state.
+    pub fn group_log_store(
+        &self,
+        shard_id: u16,
+        node_id: RaftNodeId,
+    ) -> Option<HomeKvRaftLogStore> {
+        self.groups
+            .get(&shard_id)
+            .and_then(|replicas| replicas.get(&node_id))
+            .map(|replica| replica.log_store.clone())
     }
 
     /// Stop the drive loop. Raft instances shut down on drop.
