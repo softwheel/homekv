@@ -334,10 +334,18 @@ impl FsReplicaJanitor {
 #[async_trait]
 impl LocalReplicaJanitor for FsReplicaJanitor {
     async fn remove_local_replica(&self, shard_id: u16) -> Result<(), String> {
-        let dir = self.replica_dir(shard_id);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)
-                .map_err(|e| format!("remove replica dir {}: {e}", dir.display()))?;
+        let path = self.replica_dir(shard_id);
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+                .map_err(|e| format!("remove replica dir {}: {e}", path.display()))?;
+        } else if path.exists() {
+            // The placement composition root persists each replica's Raft
+            // log store as a single `node-<id>.raft` file (see
+            // `start_replicas`); `remove_dir_all` fails on a file, so remove
+            // it directly. Without this the janitor cannot clear an
+            // unrecoverable replica after a corruption fail-closed.
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("remove replica file {}: {e}", path.display()))?;
         }
         Ok(())
     }
@@ -426,12 +434,25 @@ impl PlacementNode {
             .iter()
             .map(|id| (*id, RaftNode::new(format!("127.0.0.1:{}", node_port(*id)))))
             .collect();
-        initialize_once(
-            &catalog_replicas[&config.catalog_voters[0]].raft,
-            catalog_membership,
-            "catalog",
-        )
-        .await?;
+        // Initialize the catalog exactly once. A restart that finds existing
+        // state is not an error; a pristine replica rejoining after its store
+        // was removed (e.g. janitor cleanup of a corrupt artifact) must NOT
+        // initialize — openraft would seed a divergent single-node incarnation
+        // that can never rejoin the group. Any durable store file among the
+        // voters proves the group was already initialized.
+        let catalog_dir = config.data_dir.join("catalog");
+        let catalog_initialized = config
+            .catalog_voters
+            .iter()
+            .any(|id| catalog_dir.join(format!("node-{id}.raft")).exists());
+        if !catalog_initialized {
+            initialize_once(
+                &catalog_replicas[&config.catalog_voters[0]].raft,
+                catalog_membership,
+                "catalog",
+            )
+            .await?;
+        }
         // `initialize()` returns once the membership change is accepted, not
         // once this node has won the election. The bootstrap write below must
         // land on the leader (any error, including `ForwardToLeader`, maps to
@@ -513,12 +534,23 @@ impl PlacementNode {
                 .iter()
                 .map(|id| (*id, RaftNode::new(format!("127.0.0.1:{}", node_port(*id)))))
                 .collect();
-            initialize_once(
-                &replicas[&placement.voters[0]].raft,
-                initial,
-                &format!("group {shard_id}"),
-            )
-            .await?;
+            // Initialize the group exactly once. A pristine replica rejoining
+            // after janitor removal of a corrupt store must NOT initialize:
+            // openraft would seed a divergent single-node incarnation that
+            // can never rejoin the healthy quorum. Any durable store file
+            // among the voters proves the group was already initialized.
+            let group_initialized = placement
+                .voters
+                .iter()
+                .any(|id| group_dir.join(format!("node-{id}.raft")).exists());
+            if !group_initialized {
+                initialize_once(
+                    &replicas[&placement.voters[0]].raft,
+                    initial,
+                    &format!("group {shard_id}"),
+                )
+                .await?;
+            }
 
             for (id, replica) in &replicas {
                 let operator = LiveMembershipOperator::new(
@@ -795,6 +827,52 @@ mod tests {
 
         let listed = janitor.list_local_replicas().await.unwrap();
         assert_eq!(listed, vec![8]);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fs_janitor_removes_single_file_replica_store() {
+        // `start_replicas` persists each replica's Raft log store as a single
+        // `node-<id>.raft` FILE (not a directory). The janitor must remove
+        // that file — `remove_dir_all` alone fails on it, which previously
+        // made janitor cleanup of a corrupt replica impossible.
+        let root = std::env::temp_dir().join(format!(
+            "homekv-janitor-file-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let janitor = FsReplicaJanitor::new(root.clone(), 2);
+        let shard_dir = root.join("groups").join("0005");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let own = shard_dir.join("node-2.raft");
+        std::fs::write(&own, b"fake-raft-image").unwrap();
+        // A sibling identity's replica file must be untouched.
+        let sibling = shard_dir.join("node-3.raft");
+        std::fs::write(&sibling, b"sibling").unwrap();
+        assert_eq!(
+            janitor.list_local_replicas().await.unwrap(),
+            vec![5],
+            "shard with this node's replica file is listed before removal"
+        );
+
+        janitor.remove_local_replica(5).await.unwrap();
+        assert!(
+            !own.exists(),
+            "janitor must remove the single-file replica store"
+        );
+        assert!(sibling.exists(), "sibling replica must be untouched");
+        // `list_local_replicas` only reports shards holding THIS node's
+        // (`node-2`) replica file, so shard 5 is gone now that it was removed.
+        assert_eq!(
+            janitor.list_local_replicas().await.unwrap(),
+            Vec::<u16>::new()
+        );
+
+        // Removing a nonexistent replica is a no-op, not an error.
+        janitor.remove_local_replica(6).await.unwrap();
 
         std::fs::remove_dir_all(&root).unwrap();
     }
