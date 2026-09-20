@@ -63,3 +63,14 @@ path = "src/bin/hkvm3bench.rs"
 # untouched.
 [profile.dev]
 debug = "line-tables-only"
+
+# Fast edit/compile loop for optimized builds (e.g. performance tuning):
+# keeps release optimizations but drops LTO, uses parallel codegen units,
+# and re-enables incremental compilation. Canonical `release` remains the
+# source of truth for published binaries and benchmark claims; this profile
+# exists only to shorten local iteration.
+[profile.performance]
+inherits = "release"
+lto = false
+codegen-units = 256
+incremental = true
